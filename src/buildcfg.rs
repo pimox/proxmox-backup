@@ -15,7 +15,7 @@ macro_rules! PROXMOX_BACKUP_CACHE_DIR_M { () => ("/var/cache/proxmox-backup") }
 
 #[macro_export]
 macro_rules! PROXMOX_BACKUP_FILE_RESTORE_BIN_DIR_M {
-    () => ("/usr/lib/x86_64-linux-gnu/proxmox-backup/file-restore")
+    () => ("/usr/lib/aarch64-linux-gnu/proxmox-backup/file-restore")
 }
 
 /// namespaced directory for in-memory (tmpfs) run state
