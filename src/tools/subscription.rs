@@ -1,13 +1,21 @@
 use anyhow::{Error, format_err, bail};
 use lazy_static::lazy_static;
-use serde_json::json;
-use serde::{Deserialize, Serialize};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use proxmox::api::api;
 
-use crate::tools::{self, http::SimpleHttp};
 use proxmox::tools::fs::{replace_file, CreateOptions};
+use proxmox_http::client::SimpleHttp;
+
+use pbs_tools::json::json_object_to_query;
+
+use crate::config::node;
+use crate::tools::{
+    self,
+    pbs_simple_http,
+};
 
 /// How long the local key is valid for in between remote checks
 pub const MAX_LOCAL_KEY_AGE: i64 = 15 * 24 * 3600;
@@ -102,10 +110,16 @@ async fn register_subscription(
         "check_token": challenge,
     });
 
-    let mut client = SimpleHttp::new(None); // TODO: pass proxy_config
+    let proxy_config = if let Ok((node_config, _digest)) = node::config() {
+        node_config.http_proxy()
+    } else {
+        None
+    };
+
+    let mut client = pbs_simple_http(proxy_config);
 
     let uri = "https://shop.maurer-it.com/modules/servers/licensing/verify.php";
-    let query = tools::json_object_to_query(params)?;
+    let query = json_object_to_query(params)?;
     let response = client.post(uri, Some(query), Some("application/x-www-form-urlencoded")).await?;
     let body = SimpleHttp::response_body_string(response).await?;
 
@@ -217,7 +231,7 @@ pub fn check_subscription(key: String, server_id: String) -> Result<Subscription
 
     let now = proxmox::tools::time::epoch_i64();
 
-    let (response, challenge) = tools::runtime::block_on(register_subscription(&key, &server_id, now))
+    let (response, challenge) = pbs_runtime::block_on(register_subscription(&key, &server_id, now))
         .map_err(|err| format_err!("Error checking subscription: {}", err))?;
 
     parse_register_response(&response, key, server_id, now, &challenge)
@@ -247,15 +261,27 @@ pub fn read_subscription() -> Result<Option<SubscriptionInfo>, Error> {
     let new_checksum = base64::encode(tools::md5sum(new_checksum.as_bytes())?);
 
     if checksum != new_checksum {
-        bail!("stored checksum doesn't matches computed one '{}' != '{}'", checksum, new_checksum);
+        return Ok(Some( SubscriptionInfo {
+            status: SubscriptionStatus::INVALID,
+            message: Some("checksum mismatch".to_string()),
+            ..info
+        }));
     }
 
     let age = proxmox::tools::time::epoch_i64() - info.checktime.unwrap_or(0);
     if age < -5400 { // allow some delta for DST changes or time syncs, 1.5h
-        bail!("Last check time to far in the future.");
+        return Ok(Some( SubscriptionInfo {
+            status: SubscriptionStatus::INVALID,
+            message: Some("last check date too far in the future".to_string()),
+            ..info
+        }));
     } else if age > MAX_LOCAL_KEY_AGE + MAX_KEY_CHECK_FAILURE_AGE {
         if let SubscriptionStatus::ACTIVE = info.status {
-            bail!("subscription information too old");
+            return Ok(Some( SubscriptionInfo {
+                status: SubscriptionStatus::INVALID,
+                message: Some("subscription information too old".to_string()),
+                ..info
+            }));
         }
     }
 

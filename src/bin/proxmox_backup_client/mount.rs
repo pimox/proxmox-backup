@@ -17,18 +17,13 @@ use proxmox::{sortable, identity};
 use proxmox::api::{ApiHandler, ApiMethod, RpcEnvironment, schema::*, cli::*};
 use proxmox::tools::fd::Fd;
 
-use proxmox_backup::tools;
-use proxmox_backup::backup::{
-    load_and_decrypt_key,
-    CryptConfig,
-    IndexFile,
-    BackupDir,
-    BackupGroup,
-    BufferedDynamicReader,
-    AsyncIndexReader,
-};
-
-use proxmox_backup::client::*;
+use pbs_datastore::{BackupDir, BackupGroup, CryptConfig, load_and_decrypt_key};
+use pbs_datastore::index::IndexFile;
+use pbs_datastore::dynamic_index::BufferedDynamicReader;
+use pbs_datastore::cached_chunk_reader::CachedChunkReader;
+use pbs_client::tools::key_source::get_encryption_key_password;
+use pbs_client::{BackupReader, RemoteChunkReader};
+use pbs_tools::json::required_string_param;
 
 use crate::{
     REPO_URL_SCHEMA,
@@ -42,8 +37,6 @@ use crate::{
     api_datastore_latest_snapshot,
     BufferedDynamicReadAt,
 };
-
-use crate::proxmox_client_tools::key_source::get_encryption_key_password;
 
 #[sortable]
 const API_METHOD_MOUNT: ApiMethod = ApiMethod::new(
@@ -98,7 +91,7 @@ pub fn mount_cmd_def() -> CliCommand {
         .completion_cb("repository", complete_repository)
         .completion_cb("snapshot", complete_group_or_snapshot)
         .completion_cb("archive-name", complete_pxar_archive_name)
-        .completion_cb("target", tools::complete_file_name)
+        .completion_cb("target", pbs_tools::fs::complete_file_name)
 }
 
 pub fn map_cmd_def() -> CliCommand {
@@ -120,10 +113,10 @@ pub fn unmap_cmd_def() -> CliCommand {
 fn complete_mapping_names<S: BuildHasher>(_arg: &str, _param: &HashMap<String, String, S>)
     -> Vec<String>
 {
-    match tools::fuse_loop::find_all_mappings() {
+    match pbs_fuse_loop::find_all_mappings() {
         Ok(mappings) => mappings
             .filter_map(|(name, _)| {
-                tools::systemd::unescape_unit(&name).ok()
+                pbs_systemd::unescape_unit(&name).ok()
             }).collect(),
         Err(_) => Vec::new()
     }
@@ -139,12 +132,12 @@ fn mount(
     if verbose {
         // This will stay in foreground with debug output enabled as None is
         // passed for the RawFd.
-        return proxmox_backup::tools::runtime::main(mount_do(param, None));
+        return pbs_runtime::main(mount_do(param, None));
     }
 
     // Process should be daemonized.
     // Make sure to fork before the async runtime is instantiated to avoid troubles.
-    let (pr, pw) = proxmox_backup::tools::pipe()?;
+    let (pr, pw) = pbs_tools::io::pipe()?;
     match unsafe { fork() } {
         Ok(ForkResult::Parent { .. }) => {
             drop(pw);
@@ -155,7 +148,7 @@ fn mount(
         Ok(ForkResult::Child) => {
             drop(pr);
             nix::unistd::setsid().unwrap();
-            proxmox_backup::tools::runtime::main(mount_do(param, Some(pw)))
+            pbs_runtime::main(mount_do(param, Some(pw)))
         }
         Err(_) => bail!("failed to daemonize process"),
     }
@@ -163,14 +156,14 @@ fn mount(
 
 async fn mount_do(param: Value, pipe: Option<Fd>) -> Result<Value, Error> {
     let repo = extract_repository_from_value(&param)?;
-    let archive_name = tools::required_string_param(&param, "archive-name")?;
+    let archive_name = required_string_param(&param, "archive-name")?;
     let client = connect(&repo)?;
 
     let target = param["target"].as_str();
 
     record_repository(&repo);
 
-    let path = tools::required_string_param(&param, "snapshot")?;
+    let path = required_string_param(&param, "snapshot")?;
     let (backup_type, backup_id, backup_time) = if path.matches('/').count() == 1 {
         let group: BackupGroup = path.parse()?;
         api_datastore_latest_snapshot(&client, repo.store(), group).await?
@@ -257,11 +250,11 @@ async fn mount_do(param: Value, pipe: Option<Fd>) -> Result<Value, Error> {
         let chunk_reader = RemoteChunkReader::new(client.clone(), crypt_config, file_info.chunk_crypt_mode(), most_used);
         let reader = BufferedDynamicReader::new(index, chunk_reader);
         let archive_size = reader.archive_size();
-        let reader: proxmox_backup::pxar::fuse::Reader =
+        let reader: pbs_client::pxar::fuse::Reader =
             Arc::new(BufferedDynamicReadAt::new(reader));
-        let decoder = proxmox_backup::pxar::fuse::Accessor::new(reader, archive_size).await?;
+        let decoder = pbs_client::pxar::fuse::Accessor::new(reader, archive_size).await?;
 
-        let session = proxmox_backup::pxar::fuse::Session::mount(
+        let session = pbs_client::pxar::fuse::Session::mount(
             decoder,
             &options,
             false,
@@ -281,12 +274,12 @@ async fn mount_do(param: Value, pipe: Option<Fd>) -> Result<Value, Error> {
         let index = client.download_fixed_index(&manifest, &server_archive_name).await?;
         let size = index.index_bytes();
         let chunk_reader = RemoteChunkReader::new(client.clone(), crypt_config, file_info.chunk_crypt_mode(), HashMap::new());
-        let reader = AsyncIndexReader::new(index, chunk_reader);
+        let reader = CachedChunkReader::new(chunk_reader, index, 8).seekable();
 
         let name = &format!("{}:{}/{}", repo.to_string(), path, archive_name);
-        let name_escaped = tools::systemd::escape_unit(name, false);
+        let name_escaped = pbs_systemd::escape_unit(name, false);
 
-        let mut session = tools::fuse_loop::FuseLoopSession::map_loop(size, reader, &name_escaped, options).await?;
+        let mut session = pbs_fuse_loop::FuseLoopSession::map_loop(size, reader, &name_escaped, options).await?;
         let loopdev = session.loopdev_path.clone();
 
         let (st_send, st_recv) = futures::channel::mpsc::channel(1);
@@ -343,10 +336,10 @@ fn unmap(
     let mut name = match param["name"].as_str() {
         Some(name) => name.to_owned(),
         None => {
-            tools::fuse_loop::cleanup_unused_run_files(None);
+            pbs_fuse_loop::cleanup_unused_run_files(None);
             let mut any = false;
-            for (backing, loopdev) in tools::fuse_loop::find_all_mappings()? {
-                let name = tools::systemd::unescape_unit(&backing)?;
+            for (backing, loopdev) in pbs_fuse_loop::find_all_mappings()? {
+                let name = pbs_systemd::unescape_unit(&backing)?;
                 println!("{}:\t{}", loopdev.unwrap_or_else(|| "(unmapped)".to_string()), name);
                 any = true;
             }
@@ -363,10 +356,10 @@ fn unmap(
     }
 
     if name.starts_with("/dev/loop") {
-        tools::fuse_loop::unmap_loopdev(name)?;
+        pbs_fuse_loop::unmap_loopdev(name)?;
     } else {
-        let name = tools::systemd::escape_unit(&name, false);
-        tools::fuse_loop::unmap_name(name)?;
+        let name = pbs_systemd::escape_unit(&name, false);
+        pbs_fuse_loop::unmap_name(name)?;
     }
 
     Ok(Value::Null)

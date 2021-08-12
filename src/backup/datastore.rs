@@ -5,30 +5,51 @@ use std::sync::{Arc, Mutex};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use std::time::Duration;
-use std::fs::File;
 
 use anyhow::{bail, format_err, Error};
 use lazy_static::lazy_static;
 
-use proxmox::tools::fs::{replace_file, file_read_optional_string, CreateOptions, open_file_locked};
+use proxmox::tools::fs::{replace_file, file_read_optional_string, CreateOptions};
 
-use super::backup_info::{BackupGroup, BackupDir};
-use super::chunk_store::ChunkStore;
-use super::dynamic_index::{DynamicIndexReader, DynamicIndexWriter};
-use super::fixed_index::{FixedIndexReader, FixedIndexWriter};
-use super::manifest::{MANIFEST_BLOB_NAME, MANIFEST_LOCK_NAME, CLIENT_LOG_BLOB_NAME, BackupManifest};
-use super::index::*;
-use super::{DataBlob, ArchiveType, archive_type};
+use pbs_api_types::upid::UPID;
+use pbs_api_types::{Authid, GarbageCollectionStatus};
+use pbs_datastore::{task_log, task_warn};
+use pbs_datastore::DataBlob;
+use pbs_datastore::backup_info::{BackupGroup, BackupDir};
+use pbs_datastore::chunk_store::ChunkStore;
+use pbs_datastore::dynamic_index::{DynamicIndexReader, DynamicIndexWriter};
+use pbs_datastore::fixed_index::{FixedIndexReader, FixedIndexWriter};
+use pbs_datastore::index::IndexFile;
+use pbs_datastore::manifest::{
+    MANIFEST_BLOB_NAME, MANIFEST_LOCK_NAME, CLIENT_LOG_BLOB_NAME,
+    ArchiveType, BackupManifest,
+    archive_type,
+};
+use pbs_datastore::task::TaskState;
+use pbs_tools::format::HumanByte;
+use pbs_tools::fs::{lock_dir_noblock, DirLockGuard};
+
 use crate::config::datastore::{self, DataStoreConfig};
-use crate::task::TaskState;
 use crate::tools;
-use crate::tools::format::HumanByte;
-use crate::tools::fs::{lock_dir_noblock, DirLockGuard};
-use crate::api2::types::{Authid, GarbageCollectionStatus};
-use crate::server::UPID;
+use crate::backup::{open_backup_lockfile, BackupLockGuard};
+
 
 lazy_static! {
     static ref DATASTORE_MAP: Mutex<HashMap<String, Arc<DataStore>>> = Mutex::new(HashMap::new());
+}
+
+/// checks if auth_id is owner, or, if owner is a token, if
+/// auth_id is the user of the token
+pub fn check_backup_owner(
+    owner: &Authid,
+    auth_id: &Authid,
+) -> Result<(), Error> {
+    let correct_owner = owner == auth_id
+        || (owner.is_token() && &Authid::from(owner.user().clone()) == auth_id);
+    if !correct_owner {
+        bail!("backup owner check failed ({} != {})", auth_id, owner);
+    }
+    Ok(())
 }
 
 /// Datastore Management
@@ -54,7 +75,7 @@ impl DataStore {
 
         if let Some(datastore) = map.get(name) {
             // Compare Config - if changed, create new Datastore object!
-            if datastore.chunk_store.base == path &&
+            if datastore.chunk_store.base() == path &&
                 datastore.verify_new == config.verify_new.unwrap_or(false)
             {
                 return Ok(datastore.clone());
@@ -67,6 +88,18 @@ impl DataStore {
         map.insert(name.to_string(), datastore.clone());
 
         Ok(datastore)
+    }
+
+    /// removes all datastores that are not configured anymore
+    pub fn remove_unused_datastores() -> Result<(), Error>{
+        let (config, _digest) = datastore::config()?;
+
+        let mut map = DATASTORE_MAP.lock().unwrap();
+        // removes all elements that are not in the config
+        map.retain(|key, _| {
+            config.sections.contains_key(key)
+        });
+        Ok(())
     }
 
     fn open_with_path(store_name: &str, path: &Path, config: DataStoreConfig) -> Result<Self, Error> {
@@ -98,7 +131,7 @@ impl DataStore {
     pub fn get_chunk_iterator(
         &self,
     ) -> Result<
-        impl Iterator<Item = (Result<tools::fs::ReadDirEntry, Error>, usize, bool)>,
+        impl Iterator<Item = (Result<pbs_tools::fs::ReadDirEntry, Error>, usize, bool)>,
         Error
     > {
         self.chunk_store.get_chunk_iterator()
@@ -203,7 +236,7 @@ impl DataStore {
         wanted_files.insert(CLIENT_LOG_BLOB_NAME.to_string());
         manifest.files().iter().for_each(|item| { wanted_files.insert(item.filename.clone()); });
 
-        for item in tools::fs::read_subdir(libc::AT_FDCWD, &full_path)? {
+        for item in pbs_tools::fs::read_subdir(libc::AT_FDCWD, &full_path)? {
             if let Ok(item) = item {
                 if let Some(file_type) = item.file_type() {
                     if file_type != nix::dir::Type::File { continue; }
@@ -242,7 +275,7 @@ impl DataStore {
 
         let full_path = self.group_path(backup_group);
 
-        let _guard = tools::fs::lock_dir_noblock(&full_path, "backup group", "possible running backup")?;
+        let _guard = pbs_tools::fs::lock_dir_noblock(&full_path, "backup group", "possible running backup")?;
 
         log::info!("removing backup group {:?}", full_path);
 
@@ -318,6 +351,12 @@ impl DataStore {
         full_path.push("owner");
         let owner = proxmox::tools::fs::file_read_firstline(full_path)?;
         Ok(owner.trim_end().parse()?) // remove trailing newline
+    }
+
+    pub fn owns_backup(&self, backup_group: &BackupGroup, auth_id: &Authid) -> Result<bool, Error> {
+        let owner = self.get_owner(backup_group)?;
+
+        Ok(check_backup_owner(&owner, auth_id).is_ok())
     }
 
     /// Set the backup owner.
@@ -474,7 +513,7 @@ impl DataStore {
             tools::fail_on_shutdown()?;
             let digest = index.index_digest(pos).unwrap();
             if !self.chunk_store.cond_touch_chunk(digest, false)? {
-                crate::task_warn!(
+                task_warn!(
                     worker,
                     "warning: unable to access non-existent chunk {}, required by {:?}",
                     proxmox::tools::digest_to_hex(digest),
@@ -545,7 +584,7 @@ impl DataStore {
 
             let percentage = (i + 1) * 100 / image_count;
             if percentage > last_percentage {
-                crate::task_log!(
+                task_log!(
                     worker,
                     "marked {}% ({} of {} index files)",
                     percentage,
@@ -557,7 +596,7 @@ impl DataStore {
         }
 
         if strange_paths_count > 0 {
-            crate::task_log!(
+            task_log!(
                 worker,
                 "found (and marked) {} index files outside of expected directory scheme",
                 strange_paths_count,
@@ -591,26 +630,27 @@ impl DataStore {
             let mut gc_status = GarbageCollectionStatus::default();
             gc_status.upid = Some(upid.to_string());
 
-            crate::task_log!(worker, "Start GC phase1 (mark used chunks)");
+            task_log!(worker, "Start GC phase1 (mark used chunks)");
 
             self.mark_used_chunks(&mut gc_status, worker)?;
 
-            crate::task_log!(worker, "Start GC phase2 (sweep unused chunks)");
+            task_log!(worker, "Start GC phase2 (sweep unused chunks)");
             self.chunk_store.sweep_unused_chunks(
                 oldest_writer,
                 phase1_start_time,
                 &mut gc_status,
                 worker,
+                crate::tools::fail_on_shutdown,
             )?;
 
-            crate::task_log!(
+            task_log!(
                 worker,
                 "Removed garbage: {}",
                 HumanByte::from(gc_status.removed_bytes),
             );
-            crate::task_log!(worker, "Removed chunks: {}", gc_status.removed_chunks);
+            task_log!(worker, "Removed chunks: {}", gc_status.removed_chunks);
             if gc_status.pending_bytes > 0 {
-                crate::task_log!(
+                task_log!(
                     worker,
                     "Pending removals: {} (in {} chunks)",
                     HumanByte::from(gc_status.pending_bytes),
@@ -618,14 +658,14 @@ impl DataStore {
                 );
             }
             if gc_status.removed_bad > 0 {
-                crate::task_log!(worker, "Removed bad chunks: {}", gc_status.removed_bad);
+                task_log!(worker, "Removed bad chunks: {}", gc_status.removed_bad);
             }
 
             if gc_status.still_bad > 0 {
-                crate::task_log!(worker, "Leftover bad chunks: {}", gc_status.still_bad);
+                task_log!(worker, "Leftover bad chunks: {}", gc_status.still_bad);
             }
 
-            crate::task_log!(
+            task_log!(
                 worker,
                 "Original data usage: {}",
                 HumanByte::from(gc_status.index_data_bytes),
@@ -633,7 +673,7 @@ impl DataStore {
 
             if gc_status.index_data_bytes > 0 {
                 let comp_per = (gc_status.disk_bytes as f64 * 100.)/gc_status.index_data_bytes as f64;
-                crate::task_log!(
+                task_log!(
                     worker,
                     "On-Disk usage: {} ({:.2}%)",
                     HumanByte::from(gc_status.disk_bytes),
@@ -641,7 +681,7 @@ impl DataStore {
                 );
             }
 
-            crate::task_log!(worker, "On-Disk chunks: {}", gc_status.disk_chunks);
+            task_log!(worker, "On-Disk chunks: {}", gc_status.disk_chunks);
 
             let deduplication_factor = if gc_status.disk_bytes > 0 {
                 (gc_status.index_data_bytes as f64)/(gc_status.disk_bytes as f64)
@@ -649,11 +689,11 @@ impl DataStore {
                 1.0
             };
 
-            crate::task_log!(worker, "Deduplication factor: {:.2}", deduplication_factor);
+            task_log!(worker, "Deduplication factor: {:.2}", deduplication_factor);
 
             if gc_status.disk_chunks > 0 {
                 let avg_chunk = gc_status.disk_bytes/(gc_status.disk_chunks as u64);
-                crate::task_log!(worker, "Average chunk size: {}", HumanByte::from(avg_chunk));
+                task_log!(worker, "Average chunk size: {}", HumanByte::from(avg_chunk));
             }
 
             if let Ok(serialized) = serde_json::to_string(&gc_status) {
@@ -758,12 +798,12 @@ impl DataStore {
     fn lock_manifest(
         &self,
         backup_dir: &BackupDir,
-    ) -> Result<File, Error> {
+    ) -> Result<BackupLockGuard, Error> {
         let path = self.manifest_lock_path(backup_dir)?;
 
         // update_manifest should never take a long time, so if someone else has
         // the lock we can simply block a bit and should get it soon
-        open_file_locked(&path, Duration::from_secs(5), true)
+        open_backup_lockfile(&path, Some(Duration::from_secs(5)), true)
             .map_err(|err| {
                 format_err!(
                     "unable to acquire manifest lock {:?} - {}", &path, err
@@ -812,5 +852,43 @@ impl DataStore {
 
     pub fn verify_new(&self) -> bool {
         self.verify_new
+    }
+
+    /// returns a list of chunks sorted by their inode number on disk
+    /// chunks that could not be stat'ed are at the end of the list
+    pub fn get_chunks_in_order<F, A>(
+        &self,
+        index: &Box<dyn IndexFile + Send>,
+        skip_chunk: F,
+        check_abort: A,
+    ) -> Result<Vec<(usize, u64)>, Error>
+    where
+        F: Fn(&[u8; 32]) -> bool,
+        A: Fn(usize) -> Result<(), Error>,
+    {
+        let index_count = index.index_count();
+        let mut chunk_list = Vec::with_capacity(index_count);
+        use std::os::unix::fs::MetadataExt;
+        for pos in 0..index_count {
+            check_abort(pos)?;
+
+            let info = index.chunk_info(pos).unwrap();
+
+            if skip_chunk(&info.digest) {
+                continue;
+            }
+
+            let ino = match self.stat_chunk(&info.digest) {
+                Err(_) => u64::MAX, // could not stat, move to end of list
+                Ok(metadata) => metadata.ino(),
+            };
+
+            chunk_list.push((pos, ino));
+        }
+
+        // sorting by inode improves data locality, which makes it lots faster on spinners
+        chunk_list.sort_unstable_by(|(_, ino_a), (_, ino_b)| ino_a.cmp(&ino_b));
+
+        Ok(chunk_list)
     }
 }

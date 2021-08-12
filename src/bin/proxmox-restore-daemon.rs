@@ -1,7 +1,7 @@
 ///! Daemon binary to run inside a micro-VM for secure single file restore of disk images
 use anyhow::{bail, format_err, Error};
-use log::error;
 use lazy_static::lazy_static;
+use log::{error, info};
 
 use std::os::unix::{
     io::{FromRawFd, RawFd},
@@ -13,9 +13,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use pbs_client::DEFAULT_VSOCK_PORT;
+
 use proxmox::api::RpcEnvironmentType;
-use proxmox_backup::client::DEFAULT_VSOCK_PORT;
 use proxmox_backup::server::{rest::*, ApiConfig};
+
+use std::fs::File;
+use std::io::prelude::*;
 
 mod proxmox_restore_daemon;
 use proxmox_restore_daemon::*;
@@ -37,25 +41,52 @@ lazy_static! {
 /// This is expected to be run by 'proxmox-file-restore' within a mini-VM
 fn main() -> Result<(), Error> {
     if !Path::new(VM_DETECT_FILE).exists() {
-        bail!(concat!(
-            "This binary is not supposed to be run manually. ",
-            "Please use 'proxmox-file-restore' instead."
-        ));
+        bail!(
+            "This binary is not supposed to be run manually, use 'proxmox-file-restore' instead."
+        );
     }
 
     // don't have a real syslog (and no persistance), so use env_logger to print to a log file (via
     // stdout to a serial terminal attached by QEMU)
     env_logger::from_env(env_logger::Env::default().default_filter_or("info"))
         .write_style(env_logger::WriteStyle::Never)
+        .format_timestamp_millis()
         .init();
+
+    info!("setup basic system environment...");
+    setup_system_env().map_err(|err| format_err!("system environment setup failed: {}", err))?;
 
     // scan all attached disks now, before starting the API
     // this will panic and stop the VM if anything goes wrong
+    info!("scanning all disks...");
     {
         let _disk_state = DISK_STATE.lock().unwrap();
     }
 
-    proxmox_backup::tools::runtime::main(run())
+    info!("disk scan complete, starting main runtime...");
+
+    pbs_runtime::main(run())
+}
+
+/// ensure we have our /run dirs, system users and stuff like that setup
+fn setup_system_env() -> Result<(), Error> {
+    // the API may save some stuff there, e.g., the memcon tracking file
+    // we do not care much, but it's way less headache to just create it
+    std::fs::create_dir_all("/run/proxmox-backup")?;
+
+    // we now ensure that all lock files are owned by the backup user, and as we reuse the
+    // specialized REST module from pbs api/daemon we have some checks there for user/acl stuff
+    // that gets locked, and thus needs the backup system user to work.
+    std::fs::create_dir_all("/etc")?;
+    let mut passwd = File::create("/etc/passwd")?;
+    writeln!(passwd, "root:x:0:0:root:/root:/bin/sh")?;
+    writeln!(passwd, "backup:x:34:34:backup:/var/backups:/usr/sbin/nologin")?;
+
+    let mut group = File::create("/etc/group")?;
+    writeln!(group, "root:x:0:")?;
+    writeln!(group, "backup:x:34:")?;
+
+    Ok(())
 }
 
 async fn run() -> Result<(), Error> {

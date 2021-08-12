@@ -5,7 +5,7 @@ use serde::{Serialize, Deserialize};
 
 use proxmox::api::{
     api,
-    schema::*,
+    schema::{Schema, StringSchema},
     section_config::{
         SectionConfig,
         SectionConfigData,
@@ -13,9 +13,8 @@ use proxmox::api::{
     }
 };
 
-use proxmox::tools::{fs::replace_file, fs::CreateOptions};
-
 use crate::api2::types::*;
+use crate::backup::{open_backup_lockfile, BackupLockGuard};
 
 lazy_static! {
     pub static ref CONFIG: SectionConfig = init();
@@ -77,13 +76,14 @@ pub const DIR_NAME_SCHEMA: Schema = StringSchema::new("Directory name").schema()
             schema: PRUNE_SCHEMA_KEEP_YEARLY,
         },
         "verify-new": {
+            description: "If enabled, all new backups will be verified right after completion.",
             optional: true,
             type: bool,
         },
     }
 )]
-#[serde(rename_all="kebab-case")]
 #[derive(Serialize,Deserialize)]
+#[serde(rename_all="kebab-case")]
 /// Datastore configuration properties.
 pub struct DataStoreConfig {
     pub name: String,
@@ -133,6 +133,11 @@ fn init() -> SectionConfig {
 pub const DATASTORE_CFG_FILENAME: &str = "/etc/proxmox-backup/datastore.cfg";
 pub const DATASTORE_CFG_LOCKFILE: &str = "/etc/proxmox-backup/.datastore.lck";
 
+/// Get exclusive lock
+pub fn lock_config() -> Result<BackupLockGuard, Error> {
+    open_backup_lockfile(DATASTORE_CFG_LOCKFILE, None, true)
+}
+
 pub fn config() -> Result<(SectionConfigData, [u8;32]), Error> {
 
     let content = proxmox::tools::fs::file_read_optional_string(DATASTORE_CFG_FILENAME)?
@@ -145,19 +150,7 @@ pub fn config() -> Result<(SectionConfigData, [u8;32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(DATASTORE_CFG_FILENAME, &config)?;
-
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(DATASTORE_CFG_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(DATASTORE_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

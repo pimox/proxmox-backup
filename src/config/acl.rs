@@ -13,7 +13,6 @@ use serde::de::{value, IntoDeserializer};
 
 use proxmox::api::{api, schema::*};
 use proxmox::constnamedbitmap;
-use proxmox::tools::{fs::replace_file, fs::CreateOptions};
 
 use crate::api2::types::{Authid, Userid};
 
@@ -72,6 +71,9 @@ constnamedbitmap! {
         PRIV_TAPE_WRITE("Tape.Write");
         /// Tape.Read allows reading tape backup configuration and media contents
         PRIV_TAPE_READ("Tape.Read");
+
+        /// Realm.Allocate allows viewing, creating, modifying and deleting realms
+        PRIV_REALM_ALLOCATE("Realm.Allocate");
     }
 }
 
@@ -283,8 +285,14 @@ pub fn check_acl_path(path: &str) -> Result<(), Error> {
                 return Ok(());
             }
             match components[1] {
-                "acl" | "users" => {
+                "acl" | "users" | "domains" => {
                     if components_len == 2 {
+                        return Ok(());
+                    }
+                }
+                // /access/openid/{endpoint}
+                "openid" => {
+                    if components_len <= 3 {
                         return Ok(());
                     }
                 }
@@ -903,18 +911,7 @@ pub fn save_config(acl: &AclTree) -> Result<(), Error> {
 
     acl.write_config(&mut raw)?;
 
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(ACL_CFG_FILENAME, &raw, options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(ACL_CFG_FILENAME, &raw)
 }
 
 #[cfg(test)]

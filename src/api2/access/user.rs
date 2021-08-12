@@ -8,13 +8,17 @@ use std::collections::HashMap;
 use proxmox::api::{api, ApiMethod, Router, RpcEnvironment, Permission};
 use proxmox::api::router::SubdirMap;
 use proxmox::api::schema::{Schema, StringSchema};
-use proxmox::tools::fs::open_file_locked;
 
-use crate::api2::types::*;
+use pbs_api_types::{
+    PASSWORD_FORMAT, PROXMOX_CONFIG_DIGEST_SCHEMA, SINGLE_LINE_COMMENT_SCHEMA, Authid,
+    Tokenname, UserWithTokens, Userid,
+};
+
 use crate::config::user;
 use crate::config::token_shadow;
 use crate::config::acl::{PRIV_SYS_AUDIT, PRIV_PERMISSIONS_MODIFY};
 use crate::config::cached_user_info::CachedUserInfo;
+use crate::backup::open_backup_lockfile;
 
 pub const PBS_PASSWORD_SCHEMA: Schema = StringSchema::new("User Password.")
     .format(&PASSWORD_FORMAT)
@@ -22,77 +26,16 @@ pub const PBS_PASSWORD_SCHEMA: Schema = StringSchema::new("User Password.")
     .max_length(64)
     .schema();
 
-#[api(
-    properties: {
-        userid: {
-            type: Userid,
-        },
-        comment: {
-            optional: true,
-            schema: SINGLE_LINE_COMMENT_SCHEMA,
-        },
-        enable: {
-            optional: true,
-            schema: user::ENABLE_USER_SCHEMA,
-        },
-        expire: {
-            optional: true,
-            schema: user::EXPIRE_USER_SCHEMA,
-        },
-        firstname: {
-            optional: true,
-            schema: user::FIRST_NAME_SCHEMA,
-        },
-        lastname: {
-            schema: user::LAST_NAME_SCHEMA,
-            optional: true,
-         },
-        email: {
-            schema: user::EMAIL_SCHEMA,
-            optional: true,
-        },
-        tokens: {
-            type: Array,
-            optional: true,
-            description: "List of user's API tokens.",
-            items: {
-                type: user::ApiToken
-            },
-        },
-    }
-)]
-#[derive(Serialize,Deserialize)]
-/// User properties with added list of ApiTokens
-pub struct UserWithTokens {
-    pub userid: Userid,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub enable: Option<bool>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub expire: Option<i64>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub firstname: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub lastname: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub email: Option<String>,
-    #[serde(skip_serializing_if="Vec::is_empty", default)]
-    pub tokens: Vec<user::ApiToken>,
-}
-
-impl UserWithTokens {
-    fn new(user: user::User) -> Self {
-        Self {
-            userid: user.userid,
-            comment: user.comment,
-            enable: user.enable,
-            expire: user.expire,
-            firstname: user.firstname,
-            lastname: user.lastname,
-            email: user.email,
-            tokens: Vec::new(),
-        }
+fn new_user_with_tokens(user: user::User) -> UserWithTokens {
+    UserWithTokens {
+        userid: user.userid,
+        comment: user.comment,
+        enable: user.enable,
+        expire: user.expire,
+        firstname: user.firstname,
+        lastname: user.lastname,
+        email: user.email,
+        tokens: Vec::new(),
     }
 }
 
@@ -165,13 +108,13 @@ pub fn list_users(
             });
         iter
             .map(|user: user::User| {
-                let mut user = UserWithTokens::new(user);
+                let mut user = new_user_with_tokens(user);
                 user.tokens = user_to_tokens.remove(&user.userid).unwrap_or_default();
                 user
             })
             .collect()
     } else {
-        iter.map(UserWithTokens::new)
+        iter.map(new_user_with_tokens)
             .collect()
     };
 
@@ -226,7 +169,7 @@ pub fn create_user(
     rpcenv: &mut dyn RpcEnvironment
 ) -> Result<(), Error> {
 
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let user: user::User = serde_json::from_value(param)?;
 
@@ -368,7 +311,7 @@ pub fn update_user(
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<(), Error> {
 
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let (mut config, expected_digest) = user::config()?;
 
@@ -461,7 +404,7 @@ pub fn update_user(
 pub fn delete_user(userid: Userid, digest: Option<String>) -> Result<(), Error> {
 
     let _tfa_lock = crate::config::tfa::write_lock()?;
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let (mut config, expected_digest) = user::config()?;
 
@@ -597,7 +540,7 @@ pub fn generate_token(
     digest: Option<String>,
 ) -> Result<Value, Error> {
 
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let (mut config, expected_digest) = user::config()?;
 
@@ -678,7 +621,7 @@ pub fn update_token(
     digest: Option<String>,
 ) -> Result<(), Error> {
 
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let (mut config, expected_digest) = user::config()?;
 
@@ -746,7 +689,7 @@ pub fn delete_token(
     digest: Option<String>,
 ) -> Result<(), Error> {
 
-    let _lock = open_file_locked(user::USER_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = open_backup_lockfile(user::USER_CFG_LOCKFILE, None, true)?;
 
     let (mut config, expected_digest) = user::config()?;
 

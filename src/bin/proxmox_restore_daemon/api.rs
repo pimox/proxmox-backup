@@ -1,4 +1,9 @@
 ///! File-restore API running inside the restore VM
+use std::ffi::OsStr;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
 use anyhow::{bail, Error};
 use futures::FutureExt;
 use hyper::http::request::Parts;
@@ -6,11 +11,7 @@ use hyper::{header, Body, Response, StatusCode};
 use log::error;
 use pathpatterns::{MatchEntry, MatchPattern, MatchType, Pattern};
 use serde_json::Value;
-
-use std::ffi::OsStr;
-use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use tokio::sync::Semaphore;
 
 use proxmox::api::{
     api, schema::*, ApiHandler, ApiMethod, ApiResponseFuture, Permission, Router, RpcEnvironment,
@@ -18,14 +19,17 @@ use proxmox::api::{
 };
 use proxmox::{identity, list_subdirs_api_method, sortable};
 
+use pbs_client::pxar::{create_archive, Flags, PxarCreateOptions, ENCODER_MAX_ENTRIES};
+use pbs_tools::fs::read_subdir;
+use pbs_tools::json::required_string_param;
+use pbs_tools::zip::zip_directory;
+
 use proxmox_backup::api2::types::*;
 use proxmox_backup::backup::DirEntryAttribute;
-use proxmox_backup::pxar::{create_archive, Flags, PxarCreateOptions, ENCODER_MAX_ENTRIES};
-use proxmox_backup::tools::{self, fs::read_subdir, zip::zip_directory};
 
 use pxar::encoder::aio::TokioWriter;
 
-use super::{disk::ResolveResult, watchdog_remaining, watchdog_ping};
+use super::{disk::ResolveResult, watchdog_remaining, watchdog_inhibit, watchdog_ping};
 
 // NOTE: All API endpoints must have Permission::Superuser, as the configs for authentication do
 // not exist within the restore VM. Safety is guaranteed by checking a ticket via a custom ApiAuth.
@@ -40,6 +44,8 @@ const SUBDIRS: SubdirMap = &[
 pub const ROUTER: Router = Router::new()
     .get(&list_subdirs_api_method!(SUBDIRS))
     .subdirs(SUBDIRS);
+
+static DOWNLOAD_SEM: Semaphore = Semaphore::const_new(8);
 
 fn read_uptime() -> Result<f32, Error> {
     let uptime = fs::read_to_string("/proc/uptime")?;
@@ -205,7 +211,7 @@ fn list(
                     &c_path[..],
                     // this marks the beginning of a filesystem, i.e. '/', so this is a Directory
                     Some(&DirEntryAttribute::Directory { start: 0 }),
-                    Some(c.1),
+                    c.1,
                 ));
             }
         }
@@ -248,9 +254,17 @@ fn extract(
     _info: &ApiMethod,
     _rpcenv: Box<dyn RpcEnvironment>,
 ) -> ApiResponseFuture {
-    watchdog_ping();
+    // download can take longer than watchdog timeout, inhibit until done
+    let _inhibitor = watchdog_inhibit();
     async move {
-        let path = tools::required_string_param(&param, "path")?;
+        let _inhibitor = _inhibitor;
+
+        let _permit = match DOWNLOAD_SEM.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => bail!("maximum concurrent download limit reached, please wait for another restore to finish before attempting a new one"),
+        };
+
+        let path = required_string_param(&param, "path")?;
         let mut path = base64::decode(path)?;
         if let Some(b'/') = path.last() {
             path.pop();
@@ -279,6 +293,8 @@ fn extract(
 
         if pxar {
             tokio::spawn(async move {
+                let _inhibitor = _inhibitor;
+                let _permit = _permit;
                 let result = async move {
                     // pxar always expects a directory as it's root, so to accommodate files as
                     // well we encode the parent dir with a filter only matching the target instead
@@ -336,6 +352,8 @@ fn extract(
             });
         } else {
             tokio::spawn(async move {
+                let _inhibitor = _inhibitor;
+                let _permit = _permit;
                 let result = async move {
                     if vm_path.is_dir() {
                         zip_directory(&mut writer, &vm_path).await?;

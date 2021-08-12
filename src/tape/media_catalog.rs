@@ -2,11 +2,13 @@ use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{Write, Read, BufReader, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{PathBuf, Path};
 use std::collections::{HashSet, HashMap};
 
 use anyhow::{bail, format_err, Error};
 use endian_trait::Endian;
+
+use pbs_tools::fs::read_subdir;
 
 use proxmox::tools::{
     Uuid,
@@ -22,7 +24,6 @@ use proxmox::tools::{
 };
 
 use crate::{
-    tools::fs::read_subdir,
     backup::BackupDir,
     tape::{
         MediaId,
@@ -94,20 +95,29 @@ impl MediaCatalog {
         Ok(catalogs)
     }
 
-    /// Test if a catalog exists
-    pub fn exists(base_path: &Path, uuid: &Uuid) -> bool {
+    pub fn catalog_path(base_path: &Path, uuid: &Uuid) -> PathBuf {
         let mut path = base_path.to_owned();
         path.push(uuid.to_string());
         path.set_extension("log");
-        path.exists()
+        path
+    }
+
+    fn tmp_catalog_path(base_path: &Path, uuid: &Uuid) -> PathBuf {
+        let mut path = base_path.to_owned();
+        path.push(uuid.to_string());
+        path.set_extension("tmp");
+        path
+    }
+
+    /// Test if a catalog exists
+    pub fn exists(base_path: &Path, uuid: &Uuid) -> bool {
+        Self::catalog_path(base_path, uuid).exists()
     }
 
     /// Destroy the media catalog (remove all files)
     pub fn destroy(base_path: &Path, uuid: &Uuid) -> Result<(), Error> {
 
-        let mut path = base_path.to_owned();
-        path.push(uuid.to_string());
-        path.set_extension("log");
+        let path = Self::catalog_path(base_path, uuid);
 
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -124,9 +134,7 @@ impl MediaCatalog {
 
         let uuid = &media_id.label.uuid;
 
-        let mut path = base_path.to_owned();
-        path.push(uuid.to_string());
-        path.set_extension("log");
+        let path = Self::catalog_path(base_path, uuid);
 
         let file = match std::fs::OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
@@ -197,9 +205,7 @@ impl MediaCatalog {
 
         let uuid = &media_id.label.uuid;
 
-        let mut path = base_path.to_owned();
-        path.push(uuid.to_string());
-        path.set_extension("log");
+        let path = Self::catalog_path(base_path, uuid);
 
         let me = proxmox::try_block!({
 
@@ -225,7 +231,12 @@ impl MediaCatalog {
                 pending: Vec::new(),
             };
 
-            let (found_magic_number, _) = me.load_catalog(&mut file, media_id.media_set_label.as_ref())?;
+            // Note: lock file, to get a consistent view with load_catalog
+            nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive)?;
+            let result = me.load_catalog(&mut file, media_id.media_set_label.as_ref());
+            nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::Unlock)?;
+
+            let (found_magic_number, _) = result?;
 
             if !found_magic_number {
                 me.pending.extend(&Self::PROXMOX_BACKUP_MEDIA_CATALOG_MAGIC_1_1);
@@ -250,9 +261,7 @@ impl MediaCatalog {
 
         Self::create_basedir(base_path)?;
 
-        let mut tmp_path = base_path.to_owned();
-        tmp_path.push(uuid.to_string());
-        tmp_path.set_extension("tmp");
+        let tmp_path = Self::tmp_catalog_path(base_path, uuid);
 
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -284,9 +293,7 @@ impl MediaCatalog {
 
         let uuid = &media_id.label.uuid;
 
-        let mut tmp_path = base_path.to_owned();
-        tmp_path.push(uuid.to_string());
-        tmp_path.set_extension("tmp");
+        let tmp_path = Self::tmp_catalog_path(base_path, uuid);
 
         let me = proxmox::try_block!({
 
@@ -332,9 +339,7 @@ impl MediaCatalog {
         commit: bool,
     ) -> Result<(), Error> {
 
-        let mut tmp_path = base_path.to_owned();
-        tmp_path.push(uuid.to_string());
-        tmp_path.set_extension("tmp");
+        let tmp_path = Self::tmp_catalog_path(base_path, uuid);
 
         if commit {
             let mut catalog_path = tmp_path.clone();
@@ -372,9 +377,18 @@ impl MediaCatalog {
 
         match self.file {
             Some(ref mut file) => {
-                file.write_all(&self.pending)?;
-                file.flush()?;
-                file.sync_data()?;
+                let pending = &self.pending;
+                // Note: lock file, to get a consistent view with load_catalog
+                nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive)?;
+                let result: Result<(), Error> = proxmox::try_block!({
+                    file.write_all(pending)?;
+                    file.flush()?;
+                    file.sync_data()?;
+                    Ok(())
+                });
+                nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::Unlock)?;
+
+                result?;
             }
             None => bail!("media catalog not writable (opened read only)"),
         }
@@ -502,10 +516,26 @@ impl MediaCatalog {
         Ok(())
     }
 
+    /// Register a chunk archive
+    pub fn register_chunk_archive(
+        &mut self,
+        uuid: Uuid, // Uuid form MediaContentHeader
+        file_number: u64,
+        store: &str,
+        chunk_list: &[[u8; 32]],
+    ) -> Result<(), Error> {
+        self.start_chunk_archive(uuid, file_number, store)?;
+        for digest in chunk_list {
+            self.register_chunk(digest)?;
+        }
+        self.end_chunk_archive()?;
+        Ok(())
+    }
+
     /// Register a chunk
     ///
     /// Only valid after start_chunk_archive.
-    pub fn register_chunk(
+    fn register_chunk(
         &mut self,
         digest: &[u8;32],
     ) -> Result<(), Error> {
@@ -556,7 +586,7 @@ impl MediaCatalog {
     }
 
     /// Start a chunk archive section
-    pub fn start_chunk_archive(
+    fn start_chunk_archive(
         &mut self,
         uuid: Uuid, // Uuid form MediaContentHeader
         file_number: u64,
@@ -605,7 +635,7 @@ impl MediaCatalog {
     }
 
     /// End a chunk archive section
-    pub fn end_chunk_archive(&mut self) -> Result<(), Error> {
+    fn end_chunk_archive(&mut self) -> Result<(), Error> {
 
         match self.current_archive.take() {
             None => bail!("end_chunk_archive failed: not started"),
@@ -924,6 +954,16 @@ impl MediaSetCatalog {
         false
     }
 
+    /// Returns the media uuid and snapshot archive file number
+    pub fn lookup_snapshot(&self, store: &str, snapshot: &str) -> Option<(&Uuid, u64)> {
+        for (uuid, catalog) in self.catalog_list.iter() {
+            if let Some(nr) = catalog.lookup_snapshot(store, snapshot) {
+                return Some((uuid, nr));
+            }
+        }
+        None
+    }
+
     /// Test if the catalog already contain a chunk
     pub fn contains_chunk(&self, store: &str, digest: &[u8;32]) -> bool {
         for catalog in self.catalog_list.values() {
@@ -932,6 +972,16 @@ impl MediaSetCatalog {
             }
         }
         false
+    }
+
+    /// Returns the media uuid and chunk archive file number
+    pub fn lookup_chunk(&self, store: &str, digest: &[u8;32]) -> Option<(&Uuid, u64)> {
+        for (uuid, catalog) in self.catalog_list.iter() {
+            if let Some(nr) = catalog.lookup_chunk(store, digest) {
+                return Some((uuid, nr));
+            }
+        }
+        None
     }
 }
 

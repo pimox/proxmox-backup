@@ -16,7 +16,8 @@ use crate::tools::systemd::{self, types::*};
 use crate::server::WorkerTask;
 
 use crate::api2::types::*;
-use crate::config::datastore::DataStoreConfig;
+use crate::config::datastore::{self, DataStoreConfig};
+use crate::backup::open_backup_lockfile;
 
 #[api(
     properties: {
@@ -72,7 +73,7 @@ pub fn  list_datastore_mounts() -> Result<Vec<DatastoreMountInfo>, Error> {
     let mut list = Vec::new();
 
     let basedir = "/etc/systemd/system";
-    for item in crate::tools::fs::scan_subdir(libc::AT_FDCWD, basedir, &MOUNT_NAME_REGEX)? {
+    for item in pbs_tools::fs::scan_subdir(libc::AT_FDCWD, basedir, &MOUNT_NAME_REGEX)? {
         let item = item?;
         let name = item.file_name().to_string_lossy().to_string();
 
@@ -179,7 +180,17 @@ pub fn create_datastore_disk(
             systemd::start_unit(&mount_unit_name)?;
 
             if add_datastore {
-                crate::api2::config::datastore::create_datastore(json!({ "name": name, "path": mount_point }))?
+                let lock = open_backup_lockfile(datastore::DATASTORE_CFG_LOCKFILE, None, true)?;
+                let datastore: DataStoreConfig =
+                    serde_json::from_value(json!({ "name": name, "path": mount_point }))?;
+
+                let (config, _digest) = datastore::config()?;
+
+                if config.sections.get(&datastore.name).is_some() {
+                    bail!("datastore '{}' already exists.", datastore.name);
+                }
+
+                crate::api2::config::datastore::do_create_datastore(lock, config, datastore, Some(&worker))?;
             }
 
             Ok(())

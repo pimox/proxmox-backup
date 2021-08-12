@@ -5,15 +5,23 @@ use serde_json::Value;
 use ::serde::{Deserialize, Serialize};
 
 use proxmox::api::{api, Router, RpcEnvironment, Permission};
+use proxmox::api::section_config::SectionConfigData;
 use proxmox::api::schema::parse_property_string;
-use proxmox::tools::fs::open_file_locked;
+use pbs_datastore::task::TaskState;
 
+use crate::api2::config::sync::delete_sync_job;
+use crate::api2::config::verify::delete_verification_job;
+use crate::api2::config::tape_backup_job::{list_tape_backup_jobs, delete_tape_backup_job};
+use crate::api2::admin::{
+    sync::list_sync_jobs,
+    verify::list_verification_jobs,
+};
 use crate::api2::types::*;
 use crate::backup::*;
 use crate::config::cached_user_info::CachedUserInfo;
-use crate::config::datastore::{self, DataStoreConfig, DIR_NAME_SCHEMA};
+use crate::config::datastore::{self, DataStoreConfig};
 use crate::config::acl::{PRIV_DATASTORE_ALLOCATE, PRIV_DATASTORE_AUDIT, PRIV_DATASTORE_MODIFY};
-use crate::server::jobstate;
+use crate::server::{jobstate, WorkerTask};
 
 #[api(
     input: {
@@ -22,7 +30,7 @@ use crate::server::jobstate;
     returns: {
         description: "List the configured datastores (with config digest).",
         type: Array,
-        items: { type: datastore::DataStoreConfig },
+        items: { type: DataStoreConfig },
     },
     access: {
         permission: &Permission::Anybody,
@@ -50,88 +58,16 @@ pub fn list_datastores(
     Ok(list.into_iter().filter(filter_by_privs).collect())
 }
 
-
-// fixme: impl. const fn get_object_schema(datastore::DataStoreConfig::API_SCHEMA),
-// but this need support for match inside const fn
-// see: https://github.com/rust-lang/rust/issues/49146
-
-#[api(
-    protected: true,
-    input: {
-        properties: {
-            name: {
-                schema: DATASTORE_SCHEMA,
-            },
-            path: {
-                schema: DIR_NAME_SCHEMA,
-            },
-            comment: {
-                optional: true,
-                schema: SINGLE_LINE_COMMENT_SCHEMA,
-            },
-            "notify-user": {
-                optional: true,
-                type: Userid,
-            },
-            "notify": {
-                optional: true,
-                schema: DATASTORE_NOTIFY_STRING_SCHEMA,
-            },
-            "gc-schedule": {
-                optional: true,
-                schema: GC_SCHEDULE_SCHEMA,
-            },
-            "prune-schedule": {
-                optional: true,
-                schema: PRUNE_SCHEDULE_SCHEMA,
-            },
-            "keep-last": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_LAST,
-            },
-            "keep-hourly": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_HOURLY,
-            },
-            "keep-daily": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_DAILY,
-            },
-            "keep-weekly": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_WEEKLY,
-            },
-            "keep-monthly": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_MONTHLY,
-            },
-            "keep-yearly": {
-                optional: true,
-                schema: PRUNE_SCHEMA_KEEP_YEARLY,
-            },
-        },
-    },
-    access: {
-        permission: &Permission::Privilege(&["datastore"], PRIV_DATASTORE_ALLOCATE, false),
-    },
-)]
-/// Create new datastore config.
-pub fn create_datastore(param: Value) -> Result<(), Error> {
-
-    let _lock = open_file_locked(datastore::DATASTORE_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
-
-    let datastore: datastore::DataStoreConfig = serde_json::from_value(param)?;
-
-    let (mut config, _digest) = datastore::config()?;
-
-    if config.sections.get(&datastore.name).is_some() {
-        bail!("datastore '{}' already exists.", datastore.name);
-    }
-
+pub(crate) fn do_create_datastore(
+    _lock: BackupLockGuard,
+    mut config: SectionConfigData,
+    datastore: DataStoreConfig,
+    worker: Option<&dyn TaskState>,
+) -> Result<(), Error> {
     let path: PathBuf = datastore.path.clone().into();
 
     let backup_user = crate::backup::backup_user()?;
-    let _store = ChunkStore::create(&datastore.name, path, backup_user.uid, backup_user.gid)?;
+    let _store = ChunkStore::create(&datastore.name, path, backup_user.uid, backup_user.gid, worker)?;
 
     config.set_data(&datastore.name, "datastore", &datastore)?;
 
@@ -144,6 +80,45 @@ pub fn create_datastore(param: Value) -> Result<(), Error> {
 }
 
 #[api(
+    protected: true,
+    input: {
+        properties: {
+            config: {
+                type: DataStoreConfig,
+                flatten: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["datastore"], PRIV_DATASTORE_ALLOCATE, false),
+    },
+)]
+/// Create new datastore config.
+pub fn create_datastore(
+    config: DataStoreConfig,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<String, Error> {
+
+    let lock = datastore::lock_config()?;
+
+    let (section_config, _digest) = datastore::config()?;
+
+    if section_config.sections.get(&config.name).is_some() {
+        bail!("datastore '{}' already exists.", config.name);
+    }
+
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+
+    WorkerTask::new_thread(
+        "create-datastore",
+        Some(config.name.to_string()),
+        auth_id,
+        false,
+        move |worker| do_create_datastore(lock, section_config, config, Some(&worker)),
+    )
+}
+
+#[api(
    input: {
         properties: {
             name: {
@@ -151,7 +126,7 @@ pub fn create_datastore(param: Value) -> Result<(), Error> {
             },
         },
     },
-    returns: { type: datastore::DataStoreConfig },
+    returns: { type: DataStoreConfig },
     access: {
         permission: &Permission::Privilege(&["datastore", "{name}"], PRIV_DATASTORE_AUDIT, false),
     },
@@ -296,7 +271,7 @@ pub fn update_datastore(
     digest: Option<String>,
 ) -> Result<(), Error> {
 
-    let _lock = open_file_locked(datastore::DATASTORE_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = datastore::lock_config()?;
 
     // pass/compare digest
     let (mut config, expected_digest) = datastore::config()?;
@@ -306,7 +281,7 @@ pub fn update_datastore(
         crate::tools::detect_modified_configuration_file(&digest, &expected_digest)?;
     }
 
-    let mut data: datastore::DataStoreConfig = config.lookup("datastore", &name)?;
+    let mut data: DataStoreConfig = config.lookup("datastore", &name)?;
 
      if let Some(delete) = delete {
         for delete_prop in delete {
@@ -392,6 +367,12 @@ pub fn update_datastore(
             name: {
                 schema: DATASTORE_SCHEMA,
             },
+            "keep-job-configs": {
+                description: "If enabled, the job configurations related to this datastore will be kept.",
+                type: bool,
+                optional: true,
+                default: false,
+            },
             digest: {
                 optional: true,
                 schema: PROXMOX_CONFIG_DIGEST_SCHEMA,
@@ -403,9 +384,14 @@ pub fn update_datastore(
     },
 )]
 /// Remove a datastore configuration.
-pub fn delete_datastore(name: String, digest: Option<String>) -> Result<(), Error> {
+pub async fn delete_datastore(
+    name: String,
+    keep_job_configs: bool,
+    digest: Option<String>,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<(), Error> {
 
-    let _lock = open_file_locked(datastore::DATASTORE_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)?;
+    let _lock = datastore::lock_config()?;
 
     let (mut config, expected_digest) = datastore::config()?;
 
@@ -419,11 +405,27 @@ pub fn delete_datastore(name: String, digest: Option<String>) -> Result<(), Erro
         None => bail!("datastore '{}' does not exist.", name),
     }
 
+    if !keep_job_configs {
+        for job in list_verification_jobs(Some(name.clone()), Value::Null, rpcenv)? {
+            delete_verification_job(job.config.id, None, rpcenv)?
+        }
+        for job in list_sync_jobs(Some(name.clone()), Value::Null, rpcenv)? {
+            delete_sync_job(job.config.id, None, rpcenv)?
+        }
+
+        let tape_jobs = list_tape_backup_jobs(Value::Null, rpcenv)?;
+        for job_config in  tape_jobs.into_iter().filter(|config| config.setup.store == name) {
+            delete_tape_backup_job(job_config.id, None, rpcenv)?;
+        }
+    }
+
     datastore::save_config(&config)?;
 
     // ignore errors
     let _ = jobstate::remove_state_file("prune", &name);
     let _ = jobstate::remove_state_file("garbage_collection", &name);
+
+    crate::server::notify_datastore_removed().await?;
 
     Ok(())
 }

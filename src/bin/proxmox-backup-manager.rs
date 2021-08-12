@@ -6,10 +6,13 @@ use serde_json::{json, Value};
 
 use proxmox::api::{api, cli::*, RpcEnvironment};
 
-use proxmox_backup::tools;
+use pbs_client::{connect_to_localhost, display_task_log, view_task_result};
+use pbs_tools::percent_encoding::percent_encode_component;
+use pbs_tools::json::required_string_param;
+
 use proxmox_backup::config;
 use proxmox_backup::api2::{self, types::* };
-use proxmox_backup::client::*;
+use proxmox_backup::server::wait_for_local_worker;
 
 mod proxmox_backup_manager;
 use proxmox_backup_manager::*;
@@ -32,7 +35,7 @@ async fn start_garbage_collection(param: Value) -> Result<Value, Error> {
 
     let output_format = get_output_format(&param);
 
-    let store = tools::required_string_param(&param, "store")?;
+    let store = required_string_param(&param, "store")?;
 
     let mut client = connect_to_localhost()?;
 
@@ -63,7 +66,7 @@ async fn garbage_collection_status(param: Value) -> Result<Value, Error> {
 
     let output_format = get_output_format(&param);
 
-    let store = tools::required_string_param(&param, "store")?;
+    let store = required_string_param(&param, "store")?;
 
     let client = connect_to_localhost()?;
 
@@ -139,11 +142,12 @@ async fn task_list(param: Value) -> Result<Value, Error> {
     let mut data = result["data"].take();
     let return_type = &api2::node::tasks::API_METHOD_LIST_TASKS.returns;
 
+    use pbs_tools::format::{render_epoch, render_task_status};
     let options = default_table_format_options()
-        .column(ColumnConfig::new("starttime").right_align(false).renderer(tools::format::render_epoch))
-        .column(ColumnConfig::new("endtime").right_align(false).renderer(tools::format::render_epoch))
+        .column(ColumnConfig::new("starttime").right_align(false).renderer(render_epoch))
+        .column(ColumnConfig::new("endtime").right_align(false).renderer(render_epoch))
         .column(ColumnConfig::new("upid"))
-        .column(ColumnConfig::new("status").renderer(tools::format::render_task_status));
+        .column(ColumnConfig::new("status").renderer(render_task_status));
 
     format_and_print_result_full(&mut data, return_type, &output_format, &options);
 
@@ -162,7 +166,7 @@ async fn task_list(param: Value) -> Result<Value, Error> {
 /// Display the task log.
 async fn task_log(param: Value) -> Result<Value, Error> {
 
-    let upid = tools::required_string_param(&param, "upid")?;
+    let upid = required_string_param(&param, "upid")?;
 
     let mut client = connect_to_localhost()?;
 
@@ -183,11 +187,11 @@ async fn task_log(param: Value) -> Result<Value, Error> {
 /// Try to stop a specific task.
 async fn task_stop(param: Value) -> Result<Value, Error> {
 
-    let upid_str = tools::required_string_param(&param, "upid")?;
+    let upid_str = required_string_param(&param, "upid")?;
 
     let mut client = connect_to_localhost()?;
 
-    let path = format!("api2/json/nodes/localhost/tasks/{}", tools::percent_encode_component(upid_str));
+    let path = format!("api2/json/nodes/localhost/tasks/{}", percent_encode_component(upid_str));
     let _ = client.delete(&path, None).await?;
 
     Ok(Value::Null)
@@ -269,6 +273,14 @@ async fn pull_datastore(
             "store": {
                 schema: DATASTORE_SCHEMA,
             },
+            "ignore-verified": {
+                schema: IGNORE_VERIFIED_BACKUPS_SCHEMA,
+                optional: true,
+            },
+            "outdated-after": {
+                schema: VERIFICATION_OUTDATED_AFTER_SCHEMA,
+                optional: true,
+            },
             "output-format": {
                 schema: OUTPUT_FORMAT,
                 optional: true,
@@ -279,14 +291,14 @@ async fn pull_datastore(
 /// Verify backups
 async fn verify(
     store: String,
-    param: Value,
+    mut param: Value,
 ) -> Result<Value, Error> {
 
-    let output_format = get_output_format(&param);
+    let output_format = extract_output_format(&mut param);
 
     let mut client = connect_to_localhost()?;
 
-    let args = json!({});
+    let args = json!(param);
 
     let path = format!("api2/json/admin/datastore/{}/verify", store);
 
@@ -352,9 +364,12 @@ fn main() {
         .insert("disk", disk_commands())
         .insert("dns", dns_commands())
         .insert("network", network_commands())
+        .insert("node", node_commands())
         .insert("user", user_commands())
+        .insert("openid", openid_commands())
         .insert("remote", remote_commands())
         .insert("garbage-collection", garbage_collection_commands())
+        .insert("acme", acme_mgmt_cli())
         .insert("cert", cert_mgmt_cli())
         .insert("subscription", subscription_commands())
         .insert("sync-job", sync_job_commands())
@@ -386,7 +401,7 @@ fn main() {
     let mut rpcenv = CliEnvironment::new();
     rpcenv.set_auth_id(Some(String::from("root@pam")));
 
-   proxmox_backup::tools::runtime::main(run_async_cli_command(cmd_def, rpcenv));
+   pbs_runtime::main(run_async_cli_command(cmd_def, rpcenv));
 }
 
 // shell completion helper
@@ -397,7 +412,7 @@ pub fn complete_remote_datastore_name(_arg: &str, param: &HashMap<String, String
     let _ = proxmox::try_block!({
         let remote = param.get("remote").ok_or_else(|| format_err!("no remote"))?;
 
-        let data = crate::tools::runtime::block_on(async move {
+        let data = pbs_runtime::block_on(async move {
             crate::api2::config::remote::scan_remote_datastores(remote.clone()).await
         })?;
 

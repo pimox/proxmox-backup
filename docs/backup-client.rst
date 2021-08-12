@@ -49,13 +49,29 @@ Environment Variables
   When set, this value is used for the password required for the backup server.
   You can also set this to a API token secret.
 
+``PBS_PASSWORD_FD``, ``PBS_PASSWORD_FILE``, ``PBS_PASSWORD_CMD``
+  Like ``PBS_PASSWORD``, but read data from an open file descriptor, a file
+  name or from the `stdout` of a command, respectively. The first defined
+  environment variable from the order above is preferred.
+
 ``PBS_ENCRYPTION_PASSWORD``
   When set, this value is used to access the secret encryption key (if
   protected by password).
 
+``PBS_ENCRYPTION_PASSWORD_FD``, ``PBS_ENCRYPTION_PASSWORD_FILE``, ``PBS_ENCRYPTION_PASSWORD_CMD``
+  Like ``PBS_ENCRYPTION_PASSWORD``, but read data from an open file descriptor,
+  a file name or from the `stdout` of a command, respectively. The first
+  defined environment variable from the order above is preferred.
+
 ``PBS_FINGERPRINT`` When set, this value is used to verify the server
   certificate (only used if the system CA certificates cannot validate the
   certificate).
+
+
+.. Note:: Passwords must be valid UTF8 an may not contain
+   newlines. For your convienience, we just use the first line as
+   password, so you can add arbitrary comments after the
+   first newline.
 
 
 Output Format

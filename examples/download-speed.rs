@@ -2,8 +2,8 @@ use std::io::Write;
 
 use anyhow::{Error};
 
-use proxmox_backup::api2::types::Authid;
-use proxmox_backup::client::{HttpClient, HttpClientOptions, BackupReader};
+use pbs_api_types::Authid;
+use pbs_client::{HttpClient, HttpClientOptions, BackupReader};
 
 pub struct DummyWriter {
     bytes: usize,
@@ -59,7 +59,7 @@ async fn run() -> Result<(), Error> {
 }
 
 fn main() {
-    if let Err(err) = proxmox_backup::tools::runtime::main(run()) {
+    if let Err(err) = pbs_runtime::main(run()) {
         eprintln!("ERROR: {}", err);
     }
     println!("DONE");

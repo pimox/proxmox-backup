@@ -224,7 +224,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 			return `${url}/${encodeURIComponent(drive)}/${apiCall}`;
 		    },
 		    items: [
-			label !== undefined ? {
+			label !== "" ? {
 			    xtype: 'displayfield',
 			    name: 'label-text',
 			    value: label,
@@ -257,13 +257,13 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 	    let me = this;
 	    let drive = record.data.name;
 	    try {
-		await PBS.Async.api2({
+		await Proxmox.Async.api2({
 		    method: 'POST',
 		    timeout: 5*60*1000,
 		    url: `/api2/extjs/tape/drive/${encodeURIComponent(drive)}/unload`,
 		});
-	    } catch (error) {
-		Ext.Msg.alert(gettext('Error'), error);
+	    } catch (response) {
+		Ext.Msg.alert(gettext('Error'), response.result.message);
 	    }
 	    me.reload();
 	},
@@ -478,7 +478,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 		    Proxmox.Utils.setErrorMask(view, true);
 		    Proxmox.Utils.setErrorMask(me.lookup('content'));
 		}
-		let status_fut = PBS.Async.api2({
+		let status_fut = Proxmox.Async.api2({
 		    timeout: 5*60*1000,
 		    method: 'GET',
 		    url: `/api2/extjs/tape/changer/${encodeURIComponent(changer)}/status`,
@@ -486,12 +486,12 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 			cache: use_cache,
 		    },
 		});
-		let drives_fut = PBS.Async.api2({
+		let drives_fut = Proxmox.Async.api2({
 		    timeout: 5*60*1000,
 		    url: `/api2/extjs/tape/drive?changer=${encodeURIComponent(changer)}`,
 		});
 
-		let tapes_fut = PBS.Async.api2({
+		let tapes_fut = Proxmox.Async.api2({
 		    timeout: 5*60*1000,
 		    url: '/api2/extjs/tape/media/list',
 		    method: 'GET',
@@ -589,7 +589,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 		    Proxmox.Utils.setErrorMask(view);
 		}
 		Proxmox.Utils.setErrorMask(me.lookup('content'));
-	    } catch (err) {
+	    } catch (response) {
 		if (!view || view.isDestroyed) {
 		    return;
 		}
@@ -597,7 +597,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 		if (!use_cache) {
 		    Proxmox.Utils.setErrorMask(view);
 		}
-		Proxmox.Utils.setErrorMask(me.lookup('content'), err.toString());
+		Proxmox.Utils.setErrorMask(me.lookup('content'), response.result.message.toString());
 	    }
 
 	    me.scheduleReload(5000);
@@ -668,7 +668,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 
     listeners: {
 	deactivate: 'cancelReload',
-	destroy: 'cancelReload',
+	beforedestroy: 'cancelReload',
     },
 
     tbar: [
@@ -693,9 +693,8 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 	},
     ],
 
-    layout: 'auto',
+    layout: 'fit',
     bodyPadding: 5,
-    scrollable: true,
 
     items: [
 	{
@@ -703,7 +702,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 	    reference: 'content',
 	    layout: {
 		type: 'hbox',
-		aling: 'stretch',
+		align: 'stretch',
 	    },
 	    items: [
 		{
@@ -711,6 +710,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 		    reference: 'slots',
 		    title: gettext('Slots'),
 		    padding: 5,
+		    srollable: true,
 		    flex: 1,
 		    store: {
 			type: 'diff',
@@ -747,19 +747,19 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 				    iconCls: 'fa fa-rotate-90 fa-exchange',
 				    handler: 'slotTransfer',
 				    tooltip: gettext('Transfer'),
-				    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
+				    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
 				},
 				{
 				    iconCls: 'fa fa-trash-o',
 				    handler: 'format',
 				    tooltip: gettext('Format'),
-				    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
+				    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
 				},
 				{
 				    iconCls: 'fa fa-rotate-90 fa-upload',
 				    handler: 'load',
 				    tooltip: gettext('Load'),
-				    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
+				    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
 				},
 			    ],
 			},
@@ -771,10 +771,16 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 		    defaults: {
 			padding: 5,
 		    },
+		    layout: {
+			type: 'vbox',
+			align: 'stretch',
+		    },
 		    items: [
 			{
 			    xtype: 'grid',
 			    reference: 'drives',
+			    scrollable: true,
+			    maxHeight: 350, // ~10 drives
 			    title: gettext('Drives'),
 			    store: {
 				type: 'diff',
@@ -885,31 +891,31 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 					    iconCls: 'fa fa-rotate-270 fa-upload',
 					    handler: 'unload',
 					    tooltip: gettext('Unload'),
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
 					},
 					{
 					    iconCls: 'fa fa-hdd-o',
 					    handler: 'cartridgeMemory',
 					    tooltip: gettext('Cartridge Memory'),
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
 					},
 					{
 					    iconCls: 'fa fa-line-chart',
 					    handler: 'volumeStatistics',
 					    tooltip: gettext('Volume Statistics'),
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
 					},
 					{
 					    iconCls: 'fa fa-tag',
 					    handler: 'readLabel',
 					    tooltip: gettext('Read Label'),
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'] || rec.data['is-blocked'],
 					},
 					{
 					    iconCls: 'fa fa-info-circle',
 					    tooltip: gettext('Status'),
 					    handler: 'status',
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-blocked'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-blocked'],
 					},
 				    ],
 				},
@@ -918,6 +924,8 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 			{
 			    xtype: 'grid',
 			    reference: 'import_export',
+			    flex: 1,
+			    srollable: true,
 			    store: {
 				type: 'diff',
 				rstore: {
@@ -953,7 +961,7 @@ Ext.define('PBS.TapeManagement.ChangerStatus', {
 					    iconCls: 'fa fa-rotate-270 fa-upload',
 					    handler: 'importTape',
 					    tooltip: gettext('Import'),
-					    isDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
+					    isActionDisabled: (v, r, c, i, rec) => rec.data['is-empty'],
 					},
 				    ],
 				    width: 80,

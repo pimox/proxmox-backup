@@ -13,8 +13,6 @@ use proxmox::api::{
     }
 };
 
-use proxmox::tools::{fs::replace_file, fs::CreateOptions};
-
 use crate::api2::types::{
     Userid,
     JOB_ID_SCHEMA,
@@ -62,8 +60,8 @@ lazy_static! {
         },
     }
 )]
-#[serde(rename_all="kebab-case")]
 #[derive(Serialize,Deserialize,Clone)]
+#[serde(rename_all="kebab-case")]
 /// Tape Backup Job Setup
 pub struct TapeBackupJobSetup {
     pub store: String,
@@ -98,8 +96,8 @@ pub struct TapeBackupJobSetup {
         },
     }
 )]
-#[serde(rename_all="kebab-case")]
 #[derive(Serialize,Deserialize,Clone)]
+#[serde(rename_all="kebab-case")]
 /// Tape Backup Job
 pub struct TapeBackupJobConfig {
     pub id: String,
@@ -121,14 +119,17 @@ pub struct TapeBackupJobConfig {
         },
     },
 )]
-#[serde(rename_all="kebab-case")]
 #[derive(Serialize,Deserialize)]
+#[serde(rename_all="kebab-case")]
 /// Status of Tape Backup Job
 pub struct TapeBackupJobStatus {
     #[serde(flatten)]
     pub config: TapeBackupJobConfig,
     #[serde(flatten)]
     pub status: JobScheduleStatus,
+    /// Next tape used (best guess)
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub next_media_label: Option<String>,
 }
 
 fn init() -> SectionConfig {
@@ -159,19 +160,7 @@ pub fn config() -> Result<(SectionConfigData, [u8;32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(TAPE_JOB_CFG_FILENAME, &config)?;
-
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(TAPE_JOB_CFG_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(TAPE_JOB_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

@@ -125,6 +125,26 @@ Ext.define('PBS.DataStoreContent', {
 	    return groups;
 	},
 
+	updateGroupNotes: async function(view) {
+	    try {
+		let { result: { data: groups } } = await Proxmox.Async.api2({
+		    url: `/api2/extjs/admin/datastore/${view.datastore}/groups`,
+		});
+		let map = {};
+		for (const group of groups) {
+		    map[`${group["backup-type"]}/${group["backup-id"]}`] = group.comment;
+		}
+		view.getRootNode().cascade(node => {
+		    if (node.parentNode && node.parentNode.id === 'root') {
+			let group = `${node.data.backup_type}/${node.data.backup_id}`;
+			node.set('comment', map[group], { dirty: false });
+		    }
+		});
+	    } catch (err) {
+		console.debug(err);
+	    }
+	},
+
 	onLoad: function(store, records, success, operation) {
 	    let me = this;
 	    let view = this.getView();
@@ -242,6 +262,8 @@ Ext.define('PBS.DataStoreContent', {
 		children: children,
 	    });
 
+	    this.updateGroupNotes(view);
+
 	    if (selected !== undefined) {
 		let selection = view.getRootNode().findChildBy(function(item) {
 		    let id = item.data.text;
@@ -318,6 +340,35 @@ Ext.define('PBS.DataStoreContent', {
 	    });
 	},
 
+	pruneAll: function() {
+	    let me = this;
+	    let view = me.getView();
+
+	    if (!view.datastore) return;
+
+	    Ext.create('Proxmox.window.Edit', {
+		title: `Prune Datastore '${view.datastore}'`,
+		onlineHelp: 'maintenance_pruning',
+
+		method: 'POST',
+		submitText: "Prune",
+		autoShow: true,
+		isCreate: true,
+		showTaskViewer: true,
+
+		taskDone: () => me.reload(),
+
+		url: `/api2/extjs/admin/datastore/${view.datastore}/prune-datastore`,
+
+		items: [
+		    {
+			xtype: 'pbsPruneInputPanel',
+			dryrun: true,
+		    },
+		],
+	    });
+	},
+
 	onVerify: function(view, rI, cI, item, e, rec) {
 	    let me = this;
 	    view = me.getView();
@@ -358,29 +409,58 @@ Ext.define('PBS.DataStoreContent', {
 	    });
 	},
 
-	onNotesEdit: function(view, data) {
+	onNotesEdit: function(view, data, isGroup) {
 	    let me = this;
 
-	    let url = `/admin/datastore/${view.datastore}/notes`;
+	    let url = `/admin/datastore/${view.datastore}/`;
+	    url += isGroup ? 'group-notes' : 'notes';
+
+	    let params;
+	    if (isGroup) {
+		params = {
+		    "backup-type": data.backup_type,
+		    "backup-id": data.backup_id,
+		};
+	    } else {
+		params = {
+		    "backup-type": data["backup-type"],
+		    "backup-id": data["backup-id"],
+		    "backup-time": (data['backup-time'].getTime()/1000).toFixed(0),
+		};
+	    }
+
 	    Ext.create('PBS.window.NotesEdit', {
 		url: url,
 		autoShow: true,
 		apiCallDone: () => me.reload(), // FIXME: do something more efficient?
-		extraRequestParams: {
-		    "backup-type": data["backup-type"],
-		    "backup-id": data["backup-id"],
-		    "backup-time": (data['backup-time'].getTime()/1000).toFixed(0),
+		extraRequestParams: params,
+	    });
+	},
+
+	forgetGroup: function(data) {
+	    let me = this;
+	    let view = me.getView();
+
+	    Ext.create('Proxmox.window.SafeDestroy', {
+		url: `/admin/datastore/${view.datastore}/groups`,
+		params: {
+		    "backup-type": data.backup_type,
+		    "backup-id": data.backup_id,
+		},
+		item: {
+		    id: data.text,
+		},
+		autoShow: true,
+		taskName: 'forget-group',
+		listeners: {
+		    destroy: () => me.reload(),
 		},
 	    });
 	},
 
-	onForget: function(view, rI, cI, item, e, rec) {
+	forgetSnapshot: function(data) {
 	    let me = this;
-	    view = this.getView();
-
-	    if (!(rec && rec.data)) return;
-	    let data = rec.data;
-	    if (!view.datastore) return;
+	    let view = me.getView();
 
 	    Ext.Msg.show({
 		title: gettext('Confirm'),
@@ -394,12 +474,12 @@ Ext.define('PBS.DataStoreContent', {
 		    }
 
 		    Proxmox.Utils.API2Request({
+			url: `/admin/datastore/${view.datastore}/snapshots`,
 			params: {
 			    "backup-type": data["backup-type"],
 			    "backup-id": data["backup-id"],
 			    "backup-time": (data['backup-time'].getTime()/1000).toFixed(0),
 			},
-			url: `/admin/datastore/${view.datastore}/snapshots`,
 			method: 'DELETE',
 			waitMsgTarget: view,
 			failure: function(response, opts) {
@@ -409,6 +489,21 @@ Ext.define('PBS.DataStoreContent', {
 		    });
 		},
 	    });
+	},
+
+	onForget: function(view, rI, cI, item, e, rec) {
+	    let me = this;
+	    view = this.getView();
+
+	    if (!(rec && rec.data)) return;
+	    let data = rec.data;
+	    if (!view.datastore) return;
+
+	    if (rec.parentNode.id !== 'root') {
+		me.forgetSnapshot(data);
+	    } else {
+		me.forgetGroup(data);
+	    }
 	},
 
 	downloadFile: function(tV, rI, cI, item, e, rec) {
@@ -553,17 +648,17 @@ Ext.define('PBS.DataStoreContent', {
 	    flex: 1,
 	    renderer: (v, meta, record) => {
 		let data = record.data;
-		if (!data || data.leaf || record.parentNode.id === 'root') {
+		if (!data || data.leaf) {
 		    return '';
 		}
 		if (v === undefined || v === null) {
 		    v = '';
 		}
 		v = Ext.String.htmlEncode(v);
-		let icon = 'fa fa-fw fa-pencil pointer';
+		let icon = 'x-action-col-icon fa fa-fw fa-pencil pointer';
 
 		return `<span class="snapshot-comment-column">${v}</span>
-		    <i data-qtip="${gettext('Edit')}" style="float: right;" class="${icon}"></i>`;
+		    <i data-qtip="${gettext('Edit')}" style="float: right; margin: 0px;" class="${icon}"></i>`;
 	    },
 	    listeners: {
 		afterrender: function(component) {
@@ -576,17 +671,17 @@ Ext.define('PBS.DataStoreContent', {
 			}
 			let view = tree.up();
 			let controller = view.controller;
-			controller.onNotesEdit(view, rec.data);
+			controller.onNotesEdit(view, rec.data, rec.parentNode.id === 'root');
 		    });
 		},
 		dblclick: function(tree, el, row, col, ev, rec) {
 		    let data = rec.data || {};
-		    if (data.leaf || rec.parentNode.id === 'root') {
+		    if (data.leaf) {
 			return;
 		    }
 		    let view = tree.up();
 		    let controller = view.controller;
-		    controller.onNotesEdit(view, rec.data);
+		    controller.onNotesEdit(view, rec.data, rec.parentNode.id === 'root');
 		},
 	    },
 	},
@@ -600,31 +695,33 @@ Ext.define('PBS.DataStoreContent', {
 		    handler: 'onVerify',
 		    getTip: (v, m, rec) => Ext.String.format(gettext("Verify '{0}'"), v),
 		    getClass: (v, m, rec) => rec.data.leaf ? 'pmx-hidden' : 'pve-icon-verify-lettering',
-		    isDisabled: (v, r, c, i, rec) => !!rec.data.leaf,
+		    isActionDisabled: (v, r, c, i, rec) => !!rec.data.leaf,
                 },
                 {
 		    handler: 'onChangeOwner',
 		    getClass: (v, m, rec) => rec.parentNode.id ==='root' ? 'fa fa-user' : 'pmx-hidden',
 		    getTip: (v, m, rec) => Ext.String.format(gettext("Change owner of '{0}'"), v),
-		    isDisabled: (v, r, c, i, rec) => rec.parentNode.id !=='root',
+		    isActionDisabled: (v, r, c, i, rec) => rec.parentNode.id !=='root',
                 },
 		{
 		    handler: 'onPrune',
 		    getTip: (v, m, rec) => Ext.String.format(gettext("Prune '{0}'"), v),
 		    getClass: (v, m, rec) => rec.parentNode.id ==='root' ? 'fa fa-scissors' : 'pmx-hidden',
-		    isDisabled: (v, r, c, i, rec) => rec.parentNode.id !=='root',
+		    isActionDisabled: (v, r, c, i, rec) => rec.parentNode.id !=='root',
 		},
 		{
 		    handler: 'onForget',
-		    getTip: (v, m, rec) => Ext.String.format(gettext("Permanently forget snapshot '{0}'"), v),
-		    getClass: (v, m, rec) => !rec.data.leaf && rec.parentNode.id !== 'root' ? 'fa critical fa-trash-o' : 'pmx-hidden',
-		    isDisabled: (v, r, c, i, rec) => rec.data.leaf || rec.parentNode.id === 'root',
+		    getTip: (v, m, rec) => rec.parentNode.id !=='root'
+			? Ext.String.format(gettext("Permanently forget snapshot '{0}'"), v)
+			: Ext.String.format(gettext("Permanently forget group '{0}'"), v),
+		    getClass: (v, m, rec) => !rec.data.leaf ? 'fa critical fa-trash-o' : 'pmx-hidden',
+		    isActionDisabled: (v, r, c, i, rec) => !!rec.data.leaf,
 		},
 		{
 		    handler: 'downloadFile',
 		    getTip: (v, m, rec) => Ext.String.format(gettext("Download '{0}'"), v),
 		    getClass: (v, m, rec) => rec.data.leaf && rec.data.filename ? 'fa fa-download' : 'pmx-hidden',
-		    isDisabled: (v, r, c, i, rec) => !rec.data.leaf || !rec.data.filename || rec.data['crypt-mode'] > 2,
+		    isActionDisabled: (v, r, c, i, rec) => !rec.data.leaf || !rec.data.filename || rec.data['crypt-mode'] > 2,
 		},
 		{
 		    handler: 'openPxarBrowser',
@@ -636,7 +733,7 @@ Ext.define('PBS.DataStoreContent', {
 			}
 			return 'pmx-hidden';
 		    },
-		    isDisabled: (v, r, c, i, rec) => {
+		    isActionDisabled: (v, r, c, i, rec) => {
 			let data = rec.data;
 			return !(data.leaf &&
 			    data.filename &&
@@ -796,6 +893,11 @@ Ext.define('PBS.DataStoreContent', {
 	    text: gettext('Verify All'),
 	    confirmMsg: gettext('Do you want to verify all snapshots now?'),
 	    handler: 'verifyAll',
+	},
+	{
+	    xtype: 'proxmoxButton',
+	    text: gettext('Prune All'),
+	    handler: 'pruneAll',
 	},
 	'->',
 	{

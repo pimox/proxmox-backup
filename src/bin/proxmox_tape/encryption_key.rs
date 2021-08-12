@@ -11,14 +11,10 @@ use proxmox::{
     sys::linux::tty,
 };
 
+use pbs_datastore::Kdf;
+use pbs_datastore::paperkey::{PaperkeyFormat, generate_paper_key};
+
 use proxmox_backup::{
-    tools::{
-        self,
-        paperkey::{
-            PaperkeyFormat,
-            generate_paper_key,
-        },
-    },
     config,
     api2::{
         self,
@@ -26,7 +22,6 @@ use proxmox_backup::{
             DRIVE_NAME_SCHEMA,
             TAPE_ENCRYPTION_KEY_FINGERPRINT_SCHEMA,
             PASSWORD_HINT_SCHEMA,
-            Kdf,
         },
     },
     backup::Fingerprint,
@@ -144,8 +139,8 @@ fn show_key(
 
     let options = proxmox::api::cli::default_table_format_options()
         .column(ColumnConfig::new("kdf"))
-        .column(ColumnConfig::new("created").renderer(tools::format::render_epoch))
-        .column(ColumnConfig::new("modified").renderer(tools::format::render_epoch))
+        .column(ColumnConfig::new("created").renderer(pbs_tools::format::render_epoch))
+        .column(ColumnConfig::new("modified").renderer(pbs_tools::format::render_epoch))
         .column(ColumnConfig::new("fingerprint"))
         .column(ColumnConfig::new("hint"));
 

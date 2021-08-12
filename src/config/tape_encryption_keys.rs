@@ -15,15 +15,11 @@ use std::collections::HashMap;
 use anyhow::{bail, Error};
 use serde::{Deserialize, Serialize};
 
-use proxmox::tools::fs::{
-    file_read_optional_string,
-    replace_file,
-    open_file_locked,
-    CreateOptions,
-};
+use proxmox::tools::fs::file_read_optional_string;
 
 use crate::{
     backup::{
+        open_backup_lockfile,
         Fingerprint,
         KeyConfig,
     },
@@ -143,18 +139,7 @@ pub fn save_keys(map: HashMap<Fingerprint, EncryptionKeyInfo>) -> Result<(), Err
     }
 
     let raw = serde_json::to_string_pretty(&list)?;
-
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0600);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= root
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(nix::unistd::Gid::from_raw(0));
-
-    replace_file(TAPE_KEYS_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_secret_config(TAPE_KEYS_FILENAME, raw.as_bytes())
 }
 
 /// Store tape encryption key configurations (password protected keys)
@@ -167,19 +152,7 @@ pub fn save_key_configs(map: HashMap<Fingerprint, KeyConfig>) -> Result<(), Erro
     }
 
     let raw = serde_json::to_string_pretty(&list)?;
-
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(TAPE_KEY_CONFIG_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(TAPE_KEY_CONFIG_FILENAME, raw.as_bytes())
 }
 
 /// Insert a new key
@@ -187,11 +160,7 @@ pub fn save_key_configs(map: HashMap<Fingerprint, KeyConfig>) -> Result<(), Erro
 /// Get the lock, load both files, insert the new key, store files.
 pub fn insert_key(key: [u8;32], key_config: KeyConfig, force: bool) -> Result<(), Error> {
 
-    let _lock = open_file_locked(
-        TAPE_KEYS_LOCKFILE,
-        std::time::Duration::new(10, 0),
-        true,
-    )?;
+    let _lock = open_backup_lockfile(TAPE_KEYS_LOCKFILE, None, true)?;
 
     let (mut key_map, _) = load_keys()?;
     let (mut config_map, _) = load_key_configs()?;
@@ -225,5 +194,5 @@ pub fn complete_key_fingerprint(_arg: &str, _param: &HashMap<String, String>) ->
         Err(_) => return Vec::new(),
     };
 
-    data.keys().map(|fp| crate::tools::format::as_fingerprint(fp.bytes())).collect()
+    data.keys().map(|fp| pbs_tools::format::as_fingerprint(fp.bytes())).collect()
 }

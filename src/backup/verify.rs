@@ -6,6 +6,10 @@ use std::time::Instant;
 
 use anyhow::{bail, format_err, Error};
 
+use pbs_datastore::task_log;
+use pbs_datastore::task::TaskState;
+use pbs_tools::fs::lock_dir_noblock_shared;
+
 use crate::{
     api2::types::*,
     backup::{
@@ -23,9 +27,6 @@ use crate::{
         archive_type,
     },
     server::UPID,
-    task::TaskState,
-    task_log,
-    tools::fs::lock_dir_noblock_shared,
     tools::ParallelHandler,
 };
 
@@ -179,42 +180,18 @@ fn verify_index_chunks(
         }
     };
 
-    let index_count = index.index_count();
-    let mut chunk_list = Vec::with_capacity(index_count);
-
-    use std::os::unix::fs::MetadataExt;
-
-    for pos in 0..index_count {
+    let check_abort = |pos: usize| -> Result<(), Error> {
         if pos & 1023 == 0 {
             verify_worker.worker.check_abort()?;
             crate::tools::fail_on_shutdown()?;
         }
+        Ok(())
+    };
 
-        let info = index.chunk_info(pos).unwrap();
-
-        if skip_chunk(&info.digest) {
-            continue; // already verified or marked corrupt
-        }
-
-        match verify_worker.datastore.stat_chunk(&info.digest) {
-            Err(err) => {
-                verify_worker.corrupt_chunks.lock().unwrap().insert(info.digest);
-                task_log!(verify_worker.worker, "can't verify chunk, stat failed - {}", err);
-                errors.fetch_add(1, Ordering::SeqCst);
-                rename_corrupted_chunk(
-                    verify_worker.datastore.clone(),
-                    &info.digest,
-                    &verify_worker.worker,
-                );
-            }
-            Ok(metadata) => {
-                chunk_list.push((pos, metadata.ino()));
-            }
-        }
-    }
-
-    // sorting by inode improves data locality, which makes it lots faster on spinners
-    chunk_list.sort_unstable_by(|(_, ino_a), (_, ino_b)| ino_a.cmp(&ino_b));
+    let chunk_list =
+        verify_worker
+            .datastore
+            .get_chunks_in_order(&index, skip_chunk, check_abort)?;
 
     for (pos, _) in chunk_list {
         verify_worker.worker.check_abort()?;
@@ -574,4 +551,31 @@ pub fn verify_all_backups(
     }
 
     Ok(errors)
+}
+
+/// Filter for the verification of snapshots
+pub fn verify_filter(
+    ignore_verified_snapshots: bool,
+    outdated_after: Option<i64>,
+    manifest: &BackupManifest,
+) -> bool {
+    if !ignore_verified_snapshots {
+        return true;
+    }
+
+    let raw_verify_state = manifest.unprotected["verify_state"].clone();
+    match serde_json::from_value::<SnapshotVerifyState>(raw_verify_state) {
+        Err(_) => true, // no last verification, always include
+        Ok(last_verify) => {
+            match outdated_after {
+                None => false, // never re-verify if ignored and no max age
+                Some(max_age) => {
+                    let now = proxmox::tools::time::epoch_i64();
+                    let days_since_last_verify = (now - last_verify.upid.starttime) / 86400;
+
+                    days_since_last_verify > max_age
+                }
+            }
+        }
+    }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Error};
 
-use proxmox_backup::api2::types::Authid;
-use proxmox_backup::client::*;
+use pbs_client::{HttpClient, HttpClientOptions, BackupWriter};
+use pbs_api_types::Authid;
 
 async fn upload_speed() -> Result<f64, Error> {
 
@@ -27,7 +27,7 @@ async fn upload_speed() -> Result<f64, Error> {
 }
 
 fn main()  {
-    match proxmox_backup::tools::runtime::main(upload_speed()) {
+    match pbs_runtime::main(upload_speed()) {
         Ok(mbs) => {
             println!("average upload speed: {} MB/s", mbs);
         }

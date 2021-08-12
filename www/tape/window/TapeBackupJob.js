@@ -70,6 +70,7 @@ Ext.define('PBS.TapeManagement.BackupJobEdit', {
 		fieldLabel: gettext('Notify User'),
 		emptyText: 'root@pam',
 		allowBlank: true,
+		value: null,
 		renderer: Ext.String.htmlEncode,
 	    },
 	],
@@ -86,7 +87,7 @@ Ext.define('PBS.TapeManagement.BackupJobEdit', {
 		},
 	    },
 	    {
-		fieldLabel: gettext('Export Media Set'),
+		fieldLabel: gettext('Export Media-Set'),
 		xtype: 'proxmoxcheckbox',
 		name: 'export-media-set',
 		cbind: {

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::collections::HashSet;
 
 use anyhow::{bail, format_err, Error};
 use serde::{Serialize, Deserialize};
@@ -28,6 +29,7 @@ use crate::{
         CHANGER_NAME_SCHEMA,
         MediaPoolConfig,
         MediaListEntry,
+        MediaSetListEntry,
         MediaStatus,
         MediaContentEntry,
         VAULT_NAME_SCHEMA,
@@ -40,10 +42,79 @@ use crate::{
         Inventory,
         MediaPool,
         MediaCatalog,
+        media_catalog_snapshot_list,
         changer::update_online_status,
     },
 };
 
+#[api(
+    returns: {
+        description: "List of media sets.",
+        type: Array,
+        items: {
+            type: MediaSetListEntry,
+        },
+    },
+    access: {
+        description: "List of media sets filtered by Tape.Audit privileges on pool",
+        permission: &Permission::Anybody,
+    },
+)]
+/// List Media sets
+pub async fn list_media_sets(
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<Vec<MediaSetListEntry>, Error> {
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+    let user_info = CachedUserInfo::new()?;
+
+    let (config, _digest) = config::media_pool::config()?;
+
+    let status_path = Path::new(TAPE_STATUS_DIR);
+
+    let mut media_sets: HashSet<Uuid> = HashSet::new();
+    let mut list = Vec::new();
+
+    for (_section_type, data) in config.sections.values() {
+        let pool_name = match data["name"].as_str() {
+            None => continue,
+            Some(name) => name,
+        };
+
+        let privs = user_info.lookup_privs(&auth_id, &["tape", "pool", pool_name]);
+        if (privs & PRIV_TAPE_AUDIT) == 0  {
+            continue;
+        }
+
+        let config: MediaPoolConfig = config.lookup("pool", pool_name)?;
+
+        let changer_name = None; // assume standalone drive
+        let pool = MediaPool::with_config(status_path, &config, changer_name, true)?;
+
+        for media in pool.list_media() {
+            if let Some(label) = media.media_set_label() {
+                if media_sets.contains(&label.uuid) {
+                    continue;
+                }
+
+                let media_set_uuid = label.uuid.clone();
+                let media_set_ctime = label.ctime;
+                let media_set_name = pool
+                    .generate_media_set_name(&media_set_uuid, config.template.clone())
+                    .unwrap_or_else(|_| media_set_uuid.to_string());
+
+                media_sets.insert(media_set_uuid.clone());
+                list.push(MediaSetListEntry {
+                    media_set_name,
+                    media_set_uuid,
+                    media_set_ctime,
+                    pool: pool_name.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(list)
+}
 #[api(
     input: {
         properties: {
@@ -129,7 +200,7 @@ pub async fn list_media(
         // Call start_write_session, so that we show the same status a
         // backup job would see.
         pool.force_media_availability();
-        pool.start_write_session(current_time)?;
+        pool.start_write_session(current_time, false)?;
 
         for media in pool.list_media() {
             let expired = pool.media_is_expired(&media, current_time);
@@ -432,32 +503,28 @@ pub fn list_content(
             .generate_media_set_name(&set.uuid, template)
             .unwrap_or_else(|_| set.uuid.to_string());
 
-        let catalog = MediaCatalog::open(status_path, &media_id, false, false)?;
+        for (store, snapshot) in media_catalog_snapshot_list(status_path, &media_id)? {
+            let backup_dir: BackupDir = snapshot.parse()?;
 
-        for (store, content) in catalog.content() {
-            for snapshot in content.snapshot_index.keys() {
-                let backup_dir: BackupDir = snapshot.parse()?;
-
-                if let Some(ref backup_type) = filter.backup_type {
-                    if backup_dir.group().backup_type() != backup_type { continue; }
-                }
-                if let Some(ref backup_id) = filter.backup_id {
-                    if backup_dir.group().backup_id() != backup_id { continue; }
-                }
-
-                list.push(MediaContentEntry {
-                    uuid: media_id.label.uuid.clone(),
-                    label_text: media_id.label.label_text.to_string(),
-                    pool: set.pool.clone(),
-                    media_set_name: media_set_name.clone(),
-                    media_set_uuid: set.uuid.clone(),
-                    media_set_ctime: set.ctime,
-                    seq_nr: set.seq_nr,
-                    snapshot: snapshot.to_owned(),
-                    store: store.to_owned(),
-                    backup_time: backup_dir.backup_time(),
-                });
+            if let Some(ref backup_type) = filter.backup_type {
+                if backup_dir.group().backup_type() != backup_type { continue; }
             }
+            if let Some(ref backup_id) = filter.backup_id {
+                if backup_dir.group().backup_id() != backup_id { continue; }
+            }
+
+            list.push(MediaContentEntry {
+                uuid: media_id.label.uuid.clone(),
+                label_text: media_id.label.label_text.to_string(),
+                pool: set.pool.clone(),
+                media_set_name: media_set_name.clone(),
+                media_set_uuid: set.uuid.clone(),
+                media_set_ctime: set.ctime,
+                seq_nr: set.seq_nr,
+                snapshot: snapshot.to_owned(),
+                store: store.to_owned(),
+                backup_time: backup_dir.backup_time(),
+            });
         }
     }
 
@@ -546,6 +613,11 @@ const SUBDIRS: SubdirMap = &[
             .get(&API_METHOD_DESTROY_MEDIA)
     ),
     ( "list", &MEDIA_LIST_ROUTER ),
+    (
+        "media-sets",
+        &Router::new()
+        .get(&API_METHOD_LIST_MEDIA_SETS)
+    ),
     (
         "move",
         &Router::new()

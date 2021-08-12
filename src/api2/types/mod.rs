@@ -5,37 +5,24 @@ use serde::{Deserialize, Serialize};
 
 use proxmox::api::{api, schema::*};
 use proxmox::const_regex;
-use proxmox::{IPRE, IPRE_BRACKET, IPV4RE, IPV6RE, IPV4OCTET, IPV6H16, IPV6LS32};
+
+use pbs_datastore::catalog::CatalogEntryType;
 
 use crate::{
-    backup::{
-        CryptMode,
-        Fingerprint,
-        BACKUP_ID_REGEX,
-        DirEntryAttribute,
-        CatalogEntryType,
-    },
-    server::UPID,
+    backup::DirEntryAttribute,
     config::acl::Role,
 };
-
-#[macro_use]
-mod macros;
-
-#[macro_use]
-mod userid;
-pub use userid::{Realm, RealmRef};
-pub use userid::{Tokenname, TokennameRef};
-pub use userid::{Username, UsernameRef};
-pub use userid::Userid;
-pub use userid::Authid;
-pub use userid::{PROXMOX_TOKEN_ID_SCHEMA, PROXMOX_TOKEN_NAME_SCHEMA, PROXMOX_GROUP_ID_SCHEMA};
 
 mod tape;
 pub use tape::*;
 
 mod file_restore;
 pub use file_restore::*;
+
+mod acme;
+pub use acme::*;
+
+pub use pbs_api_types::*;
 
 // File names: may not contain slashes, may not start with "."
 pub const FILENAME_FORMAT: ApiStringFormat = ApiStringFormat::VerifyFn(|name| {
@@ -48,57 +35,13 @@ pub const FILENAME_FORMAT: ApiStringFormat = ApiStringFormat::VerifyFn(|name| {
     Ok(())
 });
 
-macro_rules! DNS_LABEL { () => (r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)") }
-macro_rules! DNS_NAME { () => (concat!(r"(?:(?:", DNS_LABEL!() , r"\.)*", DNS_LABEL!(), ")")) }
-
-macro_rules! DNS_ALIAS_LABEL { () => (r"(?:[a-zA-Z0-9_](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)") }
-macro_rules! DNS_ALIAS_NAME {
-    () => (concat!(r"(?:(?:", DNS_ALIAS_LABEL!() , r"\.)*", DNS_ALIAS_LABEL!(), ")"))
-}
-
-macro_rules! CIDR_V4_REGEX_STR { () => (concat!(r"(?:", IPV4RE!(), r"/\d{1,2})$")) }
-macro_rules! CIDR_V6_REGEX_STR { () => (concat!(r"(?:", IPV6RE!(), r"/\d{1,3})$")) }
-
 const_regex!{
-    pub IP_V4_REGEX = concat!(r"^", IPV4RE!(), r"$");
-    pub IP_V6_REGEX = concat!(r"^", IPV6RE!(), r"$");
-    pub IP_REGEX = concat!(r"^", IPRE!(), r"$");
-    pub CIDR_V4_REGEX =  concat!(r"^", CIDR_V4_REGEX_STR!(), r"$");
-    pub CIDR_V6_REGEX =  concat!(r"^", CIDR_V6_REGEX_STR!(), r"$");
-    pub CIDR_REGEX =  concat!(r"^(?:", CIDR_V4_REGEX_STR!(), "|",  CIDR_V6_REGEX_STR!(), r")$");
-
-    pub SHA256_HEX_REGEX = r"^[a-f0-9]{64}$"; // fixme: define in common_regex ?
     pub SYSTEMD_DATETIME_REGEX = r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$"; //  fixme: define in common_regex ?
-
-    pub PASSWORD_REGEX = r"^[[:^cntrl:]]*$"; // everything but control characters
-
-    /// Regex for safe identifiers.
-    ///
-    /// This
-    /// [article](https://dwheeler.com/essays/fixing-unix-linux-filenames.html)
-    /// contains further information why it is reasonable to restict
-    /// names this way. This is not only useful for filenames, but for
-    /// any identifier command line tools work with.
-    pub PROXMOX_SAFE_ID_REGEX = concat!(r"^", PROXMOX_SAFE_ID_REGEX_STR!(), r"$");
 
     /// Regex for verification jobs 'DATASTORE:ACTUAL_JOB_ID'
     pub VERIFICATION_JOB_WORKER_ID_REGEX = concat!(r"^(", PROXMOX_SAFE_ID_REGEX_STR!(), r"):");
     /// Regex for sync jobs 'REMOTE:REMOTE_DATASTORE:LOCAL_DATASTORE:ACTUAL_JOB_ID'
     pub SYNC_JOB_WORKER_ID_REGEX = concat!(r"^(", PROXMOX_SAFE_ID_REGEX_STR!(), r"):(", PROXMOX_SAFE_ID_REGEX_STR!(), r"):(", PROXMOX_SAFE_ID_REGEX_STR!(), r"):");
-
-    pub SINGLE_LINE_COMMENT_REGEX = r"^[[:^cntrl:]]*$";
-
-    pub HOSTNAME_REGEX = r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)$";
-
-    pub DNS_NAME_REGEX =  concat!(r"^", DNS_NAME!(), r"$");
-
-    pub DNS_ALIAS_REGEX =  concat!(r"^", DNS_ALIAS_NAME!(), r"$");
-
-    pub DNS_NAME_OR_IP_REGEX = concat!(r"^(?:", DNS_NAME!(), "|",  IPRE!(), r")$");
-
-    pub BACKUP_REPO_URL_REGEX = concat!(r"^^(?:(?:(", USER_ID_REGEX_STR!(), "|", APITOKEN_ID_REGEX_STR!(), ")@)?(", DNS_NAME!(), "|",  IPRE_BRACKET!() ,"):)?(?:([0-9]{1,5}):)?(", PROXMOX_SAFE_ID_REGEX_STR!(), r")$");
-
-    pub FINGERPRINT_SHA256_REGEX = r"^(?:[0-9a-fA-F][0-9a-fA-F])(?::[0-9a-fA-F][0-9a-fA-F]){31}$";
 
     pub ACL_PATH_REGEX = concat!(r"^(?:/|", r"(?:/", PROXMOX_SAFE_ID_REGEX_STR!(), ")+", r")$");
 
@@ -108,40 +51,13 @@ const_regex!{
 
     pub ZPOOL_NAME_REGEX = r"^[a-zA-Z][a-z0-9A-Z\-_.:]+$";
 
-    pub UUID_REGEX = r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$";
-
     pub DATASTORE_MAP_REGEX = concat!(r"(:?", PROXMOX_SAFE_ID_REGEX_STR!(), r"=)?", PROXMOX_SAFE_ID_REGEX_STR!());
+
+    pub TAPE_RESTORE_SNAPSHOT_REGEX = concat!(r"^", PROXMOX_SAFE_ID_REGEX_STR!(), r":", SNAPSHOT_PATH_REGEX_STR!(), r"$");
 }
 
 pub const SYSTEMD_DATETIME_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&SYSTEMD_DATETIME_REGEX);
-
-pub const IP_V4_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&IP_V4_REGEX);
-
-pub const IP_V6_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&IP_V6_REGEX);
-
-pub const IP_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&IP_REGEX);
-
-pub const PVE_CONFIG_DIGEST_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&SHA256_HEX_REGEX);
-
-pub const FINGERPRINT_SHA256_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&FINGERPRINT_SHA256_REGEX);
-
-pub const PROXMOX_SAFE_ID_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&PROXMOX_SAFE_ID_REGEX);
-
-pub const BACKUP_ID_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&BACKUP_ID_REGEX);
-
-pub const UUID_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&UUID_REGEX);
-
-pub const SINGLE_LINE_COMMENT_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&SINGLE_LINE_COMMENT_REGEX);
 
 pub const HOSTNAME_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&HOSTNAME_REGEX);
@@ -155,23 +71,11 @@ pub const DNS_ALIAS_FORMAT: ApiStringFormat =
 pub const DNS_NAME_OR_IP_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&DNS_NAME_OR_IP_REGEX);
 
-pub const PASSWORD_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&PASSWORD_REGEX);
-
 pub const ACL_PATH_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&ACL_PATH_REGEX);
 
 pub const NETWORK_INTERFACE_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&PROXMOX_SAFE_ID_REGEX);
-
-pub const CIDR_V4_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&CIDR_V4_REGEX);
-
-pub const CIDR_V6_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&CIDR_V6_REGEX);
-
-pub const CIDR_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&CIDR_REGEX);
 
 pub const SUBSCRIPTION_KEY_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&SUBSCRIPTION_KEY_REGEX);
@@ -181,6 +85,9 @@ pub const BLOCKDEVICE_NAME_FORMAT: ApiStringFormat =
 
 pub const DATASTORE_MAP_FORMAT: ApiStringFormat =
     ApiStringFormat::Pattern(&DATASTORE_MAP_REGEX);
+
+pub const TAPE_RESTORE_SNAPSHOT_FORMAT: ApiStringFormat =
+    ApiStringFormat::Pattern(&TAPE_RESTORE_SNAPSHOT_REGEX);
 
 pub const PASSWORD_SCHEMA: Schema = StringSchema::new("Password.")
     .format(&PASSWORD_FORMAT)
@@ -194,28 +101,11 @@ pub const PBS_PASSWORD_SCHEMA: Schema = StringSchema::new("User Password.")
     .max_length(64)
     .schema();
 
-pub const CERT_FINGERPRINT_SHA256_SCHEMA: Schema = StringSchema::new(
-    "X509 certificate fingerprint (sha256)."
-)
-    .format(&FINGERPRINT_SHA256_FORMAT)
-    .schema();
-
 pub const TAPE_ENCRYPTION_KEY_FINGERPRINT_SCHEMA: Schema = StringSchema::new(
     "Tape encryption key fingerprint (sha256)."
 )
     .format(&FINGERPRINT_SHA256_FORMAT)
     .schema();
-
-pub const PROXMOX_CONFIG_DIGEST_SCHEMA: Schema = StringSchema::new(
-    "Prevent changes if current configuration file has different \
-    SHA256 digest. This can be used to prevent concurrent \
-    modifications."
-)
-    .format(&PVE_CONFIG_DIGEST_FORMAT) .schema();
-
-
-pub const CHUNK_DIGEST_FORMAT: ApiStringFormat =
-    ApiStringFormat::Pattern(&SHA256_HEX_REGEX);
 
 pub const CHUNK_DIGEST_SCHEMA: Schema = StringSchema::new("Chunk digest (SHA256).")
     .format(&CHUNK_DIGEST_FORMAT)
@@ -341,37 +231,8 @@ pub struct AclListItem {
     pub roleid: String,
 }
 
-pub const BACKUP_ARCHIVE_NAME_SCHEMA: Schema =
-    StringSchema::new("Backup archive name.")
-    .format(&PROXMOX_SAFE_ID_FORMAT)
-    .schema();
-
-pub const BACKUP_TYPE_SCHEMA: Schema =
-    StringSchema::new("Backup type.")
-    .format(&ApiStringFormat::Enum(&[
-        EnumEntry::new("vm", "Virtual Machine Backup"),
-        EnumEntry::new("ct", "Container Backup"),
-        EnumEntry::new("host", "Host Backup")]))
-    .schema();
-
-pub const BACKUP_ID_SCHEMA: Schema =
-    StringSchema::new("Backup ID.")
-    .format(&BACKUP_ID_FORMAT)
-    .schema();
-
-pub const BACKUP_TIME_SCHEMA: Schema =
-    IntegerSchema::new("Backup time (Unix epoch.)")
-    .minimum(1_547_797_308)
-    .schema();
-
 pub const UPID_SCHEMA: Schema = StringSchema::new("Unique Process/Task ID.")
     .max_length(256)
-    .schema();
-
-pub const DATASTORE_SCHEMA: Schema = StringSchema::new("Datastore name.")
-    .format(&PROXMOX_SAFE_ID_FORMAT)
-    .min_length(3)
-    .max_length(32)
     .schema();
 
 pub const DATASTORE_MAP_SCHEMA: Schema = StringSchema::new("Datastore mapping.")
@@ -391,6 +252,12 @@ pub const DATASTORE_MAP_LIST_SCHEMA: Schema = StringSchema::new(
     all other sources to the default 'e'. If no default is given, only the \
     specified sources are mapped.")
     .format(&ApiStringFormat::PropertyString(&DATASTORE_MAP_ARRAY_SCHEMA))
+    .schema();
+
+pub const TAPE_RESTORE_SNAPSHOT_SCHEMA: Schema = StringSchema::new(
+    "A snapshot in the format: 'store:type/id/time")
+    .format(&TAPE_RESTORE_SNAPSHOT_FORMAT)
+    .type_text("store:type/id/time")
     .schema();
 
 pub const MEDIA_SET_UUID_SCHEMA: Schema =
@@ -454,10 +321,6 @@ pub const VERIFICATION_OUTDATED_AFTER_SCHEMA: Schema = IntegerSchema::new(
     .minimum(1)
     .schema();
 
-pub const SINGLE_LINE_COMMENT_SCHEMA: Schema = StringSchema::new("Comment (single line).")
-    .format(&SINGLE_LINE_COMMENT_FORMAT)
-    .schema();
-
 pub const HOSTNAME_SCHEMA: Schema = StringSchema::new("Hostname (as defined in RFC1123).")
     .format(&HOSTNAME_FORMAT)
     .schema();
@@ -478,343 +341,13 @@ pub const BLOCKDEVICE_NAME_SCHEMA: Schema = StringSchema::new("Block device name
     .max_length(64)
     .schema();
 
+pub const REALM_ID_SCHEMA: Schema = StringSchema::new("Realm name.")
+    .format(&PROXMOX_SAFE_ID_FORMAT)
+    .min_length(2)
+    .max_length(32)
+    .schema();
+
 // Complex type definitions
-
-#[api(
-    properties: {
-        store: {
-            schema: DATASTORE_SCHEMA,
-        },
-        comment: {
-            optional: true,
-            schema: SINGLE_LINE_COMMENT_SCHEMA,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Basic information about a datastore.
-pub struct DataStoreListItem {
-    pub store: String,
-    pub comment: Option<String>,
-}
-
-#[api(
-    properties: {
-        "backup-type": {
-            schema: BACKUP_TYPE_SCHEMA,
-        },
-        "backup-id": {
-            schema: BACKUP_ID_SCHEMA,
-        },
-        "last-backup": {
-            schema: BACKUP_TIME_SCHEMA,
-        },
-        "backup-count": {
-            type: Integer,
-        },
-        files: {
-            items: {
-                schema: BACKUP_ARCHIVE_NAME_SCHEMA
-            },
-        },
-        owner: {
-            type: Authid,
-            optional: true,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Basic information about a backup group.
-pub struct GroupListItem {
-    pub backup_type: String, // enum
-    pub backup_id: String,
-    pub last_backup: i64,
-    /// Number of contained snapshots
-    pub backup_count: u64,
-    /// List of contained archive files.
-    pub files: Vec<String>,
-    /// The owner of group
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub owner: Option<Authid>,
-}
-
-#[api()]
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-/// Result of a verify operation.
-pub enum VerifyState {
-    /// Verification was successful
-    Ok,
-    /// Verification reported one or more errors
-    Failed,
-}
-
-#[api(
-    properties: {
-        upid: {
-            schema: UPID_SCHEMA
-        },
-        state: {
-            type: VerifyState
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-/// Task properties.
-pub struct SnapshotVerifyState {
-    /// UPID of the verify task
-    pub upid: UPID,
-    /// State of the verification. Enum.
-    pub state: VerifyState,
-}
-
-#[api(
-    properties: {
-        "backup-type": {
-            schema: BACKUP_TYPE_SCHEMA,
-        },
-        "backup-id": {
-            schema: BACKUP_ID_SCHEMA,
-        },
-        "backup-time": {
-            schema: BACKUP_TIME_SCHEMA,
-        },
-        comment: {
-            schema: SINGLE_LINE_COMMENT_SCHEMA,
-            optional: true,
-        },
-        verification: {
-            type: SnapshotVerifyState,
-            optional: true,
-        },
-        fingerprint: {
-            type: String,
-            optional: true,
-        },
-        files: {
-            items: {
-                schema: BACKUP_ARCHIVE_NAME_SCHEMA
-            },
-        },
-        owner: {
-            type: Authid,
-            optional: true,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Basic information about backup snapshot.
-pub struct SnapshotListItem {
-    pub backup_type: String, // enum
-    pub backup_id: String,
-    pub backup_time: i64,
-    /// The first line from manifest "notes"
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub comment: Option<String>,
-    /// The result of the last run verify task
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub verification: Option<SnapshotVerifyState>,
-    /// Fingerprint of encryption key
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub fingerprint: Option<Fingerprint>,
-    /// List of contained archive files.
-    pub files: Vec<BackupContent>,
-    /// Overall snapshot size (sum of all archive sizes).
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub size: Option<u64>,
-    /// The owner of the snapshots group
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub owner: Option<Authid>,
-}
-
-#[api(
-    properties: {
-        "backup-type": {
-            schema: BACKUP_TYPE_SCHEMA,
-        },
-        "backup-id": {
-            schema: BACKUP_ID_SCHEMA,
-        },
-        "backup-time": {
-            schema: BACKUP_TIME_SCHEMA,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Prune result.
-pub struct PruneListItem {
-    pub backup_type: String, // enum
-    pub backup_id: String,
-    pub backup_time: i64,
-    /// Keep snapshot
-    pub keep: bool,
-}
-
-pub const PRUNE_SCHEMA_KEEP_DAILY: Schema = IntegerSchema::new(
-    "Number of daily backups to keep.")
-    .minimum(1)
-    .schema();
-
-pub const PRUNE_SCHEMA_KEEP_HOURLY: Schema = IntegerSchema::new(
-    "Number of hourly backups to keep.")
-    .minimum(1)
-    .schema();
-
-pub const PRUNE_SCHEMA_KEEP_LAST: Schema = IntegerSchema::new(
-    "Number of backups to keep.")
-    .minimum(1)
-    .schema();
-
-pub const PRUNE_SCHEMA_KEEP_MONTHLY: Schema = IntegerSchema::new(
-    "Number of monthly backups to keep.")
-    .minimum(1)
-    .schema();
-
-pub const PRUNE_SCHEMA_KEEP_WEEKLY: Schema = IntegerSchema::new(
-    "Number of weekly backups to keep.")
-    .minimum(1)
-    .schema();
-
-pub const PRUNE_SCHEMA_KEEP_YEARLY: Schema = IntegerSchema::new(
-    "Number of yearly backups to keep.")
-    .minimum(1)
-    .schema();
-
-#[api(
-    properties: {
-        "filename": {
-            schema: BACKUP_ARCHIVE_NAME_SCHEMA,
-        },
-        "crypt-mode": {
-            type: CryptMode,
-            optional: true,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Basic information about archive files inside a backup snapshot.
-pub struct BackupContent {
-    pub filename: String,
-    /// Info if file is encrypted, signed, or neither.
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub crypt_mode: Option<CryptMode>,
-    /// Archive size (from backup manifest).
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub size: Option<u64>,
-}
-
-#[api(
-    properties: {
-        "upid": {
-            optional: true,
-            schema: UPID_SCHEMA,
-        },
-    },
-)]
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all="kebab-case")]
-/// Garbage collection status.
-pub struct GarbageCollectionStatus {
-    pub upid: Option<String>,
-    /// Number of processed index files.
-    pub index_file_count: usize,
-    /// Sum of bytes referred by index files.
-    pub index_data_bytes: u64,
-    /// Bytes used on disk.
-    pub disk_bytes: u64,
-    /// Chunks used on disk.
-    pub disk_chunks: usize,
-    /// Sum of removed bytes.
-    pub removed_bytes: u64,
-    /// Number of removed chunks.
-    pub removed_chunks: usize,
-    /// Sum of pending bytes (pending removal - kept for safety).
-    pub pending_bytes: u64,
-    /// Number of pending chunks (pending removal - kept for safety).
-    pub pending_chunks: usize,
-    /// Number of chunks marked as .bad by verify that have been removed by GC.
-    pub removed_bad: usize,
-    /// Number of chunks still marked as .bad after garbage collection.
-    pub still_bad: usize,
-}
-
-impl Default for GarbageCollectionStatus {
-    fn default() -> Self {
-        GarbageCollectionStatus {
-            upid: None,
-            index_file_count: 0,
-            index_data_bytes: 0,
-            disk_bytes: 0,
-            disk_chunks: 0,
-            removed_bytes: 0,
-            removed_chunks: 0,
-            pending_bytes: 0,
-            pending_chunks: 0,
-            removed_bad: 0,
-            still_bad: 0,
-        }
-    }
-}
-
-#[api()]
-#[derive(Default, Serialize, Deserialize)]
-/// Storage space usage information.
-pub struct StorageStatus {
-    /// Total space (bytes).
-    pub total: u64,
-    /// Used space (bytes).
-    pub used: u64,
-    /// Available space (bytes).
-    pub avail: u64,
-}
-
-#[api()]
-#[derive(Serialize, Deserialize, Default)]
-/// Backup Type group/snapshot counts.
-pub struct TypeCounts {
-    /// The number of groups of the type.
-    pub groups: u64,
-    /// The number of snapshots of the type.
-    pub snapshots: u64,
-}
-
-#[api(
-    properties: {
-        ct: {
-            type: TypeCounts,
-            optional: true,
-        },
-        host: {
-            type: TypeCounts,
-            optional: true,
-        },
-        vm: {
-            type: TypeCounts,
-            optional: true,
-        },
-        other: {
-            type: TypeCounts,
-            optional: true,
-        },
-    },
-)]
-#[derive(Serialize, Deserialize, Default)]
-/// Counts of groups/snapshots per BackupType.
-pub struct Counts {
-    /// The counts for CT backups
-    pub ct: Option<TypeCounts>,
-    /// The counts for Host backups
-    pub host: Option<TypeCounts>,
-    /// The counts for VM backups
-    pub vm: Option<TypeCounts>,
-    /// The counts for other backup types
-    pub other: Option<TypeCounts>,
-}
 
 #[api(
     properties: {
@@ -1400,94 +933,6 @@ pub const DATASTORE_NOTIFY_STRING_SCHEMA: Schema = StringSchema::new(
     .schema();
 
 
-pub const PASSWORD_HINT_SCHEMA: Schema = StringSchema::new("Password hint.")
-    .format(&SINGLE_LINE_COMMENT_FORMAT)
-    .min_length(1)
-    .max_length(64)
-    .schema();
-
-#[api(default: "scrypt")]
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-/// Key derivation function for password protected encryption keys.
-pub enum Kdf {
-    /// Do not encrypt the key.
-    None,
-    /// Encrypt they key with a password using SCrypt.
-    Scrypt,
-    /// Encrtypt the Key with a password using PBKDF2
-    PBKDF2,
-}
-
-impl Default for Kdf {
-    #[inline]
-    fn default() -> Self {
-        Kdf::Scrypt
-    }
-}
-
-#[api(
-    properties: {
-        kdf: {
-            type: Kdf,
-        },
-        fingerprint: {
-            schema: CERT_FINGERPRINT_SHA256_SCHEMA,
-            optional: true,
-        },
-    },
-)]
-#[derive(Deserialize, Serialize)]
-/// Encryption Key Information
-pub struct KeyInfo {
-    /// Path to key (if stored in a file)
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub path: Option<String>,
-    pub kdf: Kdf,
-    /// Key creation time
-    pub created: i64,
-    /// Key modification time
-    pub modified: i64,
-    /// Key fingerprint
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub fingerprint: Option<String>,
-    /// Password hint
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub hint: Option<String>,
-}
-
-#[api]
-#[derive(Deserialize, Serialize)]
-/// RSA public key information
-pub struct RsaPubKeyInfo {
-    /// Path to key (if stored in a file)
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub path: Option<String>,
-    /// RSA exponent
-    pub exponent: String,
-    /// Hex-encoded RSA modulus
-    pub modulus: String,
-    /// Key (modulus) length in bits
-    pub length: usize,
-}
-
-impl std::convert::TryFrom<openssl::rsa::Rsa<openssl::pkey::Public>> for RsaPubKeyInfo {
-    type Error = anyhow::Error;
-
-    fn try_from(value: openssl::rsa::Rsa<openssl::pkey::Public>) -> Result<Self, Self::Error> {
-        let modulus = value.n().to_hex_str()?.to_string();
-        let exponent = value.e().to_dec_str()?.to_string();
-        let length = value.size() as usize * 8;
-
-        Ok(Self {
-            path: None,
-            exponent,
-            modulus,
-            length,
-        })
-    }
-}
-
 #[api(
     properties: {
         "next-run": {
@@ -1512,8 +957,8 @@ impl std::convert::TryFrom<openssl::rsa::Rsa<openssl::pkey::Public>> for RsaPubK
         },
     }
 )]
-#[serde(rename_all="kebab-case")]
 #[derive(Serialize,Deserialize,Default)]
+#[serde(rename_all="kebab-case")]
 /// Job Scheduling Status
 pub struct JobScheduleStatus {
     #[serde(skip_serializing_if="Option::is_none")]
@@ -1624,7 +1069,7 @@ pub struct NodeStatus {
 pub const HTTP_PROXY_SCHEMA: Schema = StringSchema::new(
     "HTTP proxy configuration [http://]<host>[:port]")
     .format(&ApiStringFormat::VerifyFn(|s| {
-        crate::tools::http::ProxyConfig::parse_proxy_url(s)?;
+        proxmox_http::ProxyConfig::parse_proxy_url(s)?;
         Ok(())
     }))
     .min_length(1)

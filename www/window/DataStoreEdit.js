@@ -6,6 +6,9 @@ Ext.define('PBS.panel.PruneInputPanel', {
 
     onlineHelp: 'maintenance_pruning',
 
+    // show/hide dry-run field
+    dryrun: false,
+
     cbindData: function() {
 	let me = this;
 	me.isCreate = !!me.isCreate;
@@ -16,7 +19,7 @@ Ext.define('PBS.panel.PruneInputPanel', {
 	{
 	    xtype: 'pbsPruneKeepInput',
 	    name: 'keep-last',
-	    fieldLabel: gettext('keep-last'),
+	    fieldLabel: gettext('Keep Last'),
 	    cbind: {
 		deleteEmpty: '{!isCreate}',
 	    },
@@ -65,6 +68,18 @@ Ext.define('PBS.panel.PruneInputPanel', {
 	},
     ],
 
+    columnB: [
+	{
+	    xtype: 'proxmoxcheckbox',
+	    name: 'dry-run',
+	    fieldLabel: gettext('Dry Run'),
+	    cbind: {
+		hidden: '{!dryrun}',
+		disabled: '{!dryrun}',
+	    },
+	},
+    ],
+
 });
 Ext.define('PBS.DataStoreEdit', {
     extend: 'Proxmox.window.Edit',
@@ -75,6 +90,7 @@ Ext.define('PBS.DataStoreEdit', {
     isAdd: true,
 
     bodyPadding: 0,
+    showProgress: true,
 
     cbindData: function(initialConfig) {
 	var me = this;

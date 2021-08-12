@@ -5,19 +5,21 @@ mod virtual_tape;
 mod lto;
 pub use lto::*;
 
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use anyhow::{bail, format_err, Error};
 use ::serde::{Deserialize};
 use serde_json::Value;
+use nix::fcntl::OFlag;
+use nix::sys::stat::Mode;
 
 use proxmox::{
     tools::{
         Uuid,
         io::ReadExt,
         fs::{
-            fchown,
+            lock_file,
+            atomic_open_or_create_file,
             file_read_optional_string,
             replace_file,
             CreateOptions,
@@ -26,9 +28,10 @@ use proxmox::{
     api::section_config::SectionConfigData,
 };
 
+use pbs_datastore::task_log;
+use pbs_datastore::task::TaskState;
+
 use crate::{
-    task_log,
-    task::TaskState,
     backup::{
         Fingerprint,
         KeyConfig,
@@ -79,6 +82,9 @@ pub trait TapeDriver {
 
     /// Move to last file
     fn move_to_last_file(&mut self) -> Result<(), Error>;
+
+    /// Move to given file nr
+    fn move_to_file(&mut self, file: u64) -> Result<(), Error>;
 
     /// Current file number
     fn current_file_number(&mut self) -> Result<u64, Error>;
@@ -318,6 +324,37 @@ pub fn open_drive(
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum TapeRequestError {
+    None,
+    EmptyTape,
+    OpenFailed(String),
+    WrongLabel(String),
+    ReadFailed(String),
+}
+
+impl std::fmt::Display for TapeRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TapeRequestError::None => {
+                write!(f, "no error")
+            },
+            TapeRequestError::OpenFailed(reason) => {
+                write!(f, "tape open failed - {}", reason)
+            }
+            TapeRequestError::WrongLabel(label) => {
+                write!(f, "wrong media label {}", label)
+            }
+            TapeRequestError::EmptyTape => {
+                write!(f, "found empty media without label (please label all tapes first)")
+            }
+            TapeRequestError::ReadFailed(reason) => {
+                write!(f, "tape read failed - {}", reason)
+            }
+        }
+    }
+}
+
 /// Requests a specific 'media' to be inserted into 'drive'. Within a
 /// loop, this then tries to read the media label and waits until it
 /// finds the requested media.
@@ -385,84 +422,87 @@ pub fn request_and_load_media(
                         return Ok((handle, media_id));
                     }
 
-                    let mut last_media_uuid = None;
-                    let mut last_error = None;
+                    let mut last_error = TapeRequestError::None;
 
-                    let mut tried = false;
-                    let mut failure_reason = None;
+                    let update_and_log_request_error =
+                        |old: &mut TapeRequestError, new: TapeRequestError| -> Result<(), Error>
+                    {
+                        if new != *old {
+                            task_log!(worker, "{}", new);
+                            task_log!(
+                                worker,
+                                "Please insert media '{}' into drive '{}'",
+                                label_text,
+                                drive
+                            );
+                            if let Some(to) = notify_email {
+                                send_load_media_email(
+                                    drive,
+                                    &label_text,
+                                    to,
+                                    Some(new.to_string()),
+                                )?;
+                            }
+                            *old = new;
+                        }
+                        Ok(())
+                    };
 
                     loop {
                         worker.check_abort()?;
 
-                        if tried {
-                            if let Some(reason) = failure_reason {
-                                task_log!(worker, "Please insert media '{}' into drive '{}'", label_text, drive);
-                                if let Some(to) = notify_email {
-                                    send_load_media_email(drive, &label_text, to, Some(reason))?;
-                                }
-                            }
-
-                            failure_reason = None;
-
+                        if last_error != TapeRequestError::None {
                             for _ in 0..50 { // delay 5 seconds
                                 worker.check_abort()?;
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                             }
+                        } else {
+                            task_log!(
+                                worker,
+                                "Checking for media '{}' in drive '{}'",
+                                label_text,
+                                drive
+                            );
                         }
-
-                        tried = true;
 
                         let mut handle = match drive_config.open() {
                             Ok(handle) => handle,
                             Err(err) => {
-                                let err = err.to_string();
-                                if Some(err.clone()) != last_error {
-                                    task_log!(worker, "tape open failed - {}", err);
-                                    last_error = Some(err);
-                                    failure_reason = last_error.clone();
-                                }
+                                update_and_log_request_error(
+                                    &mut last_error,
+                                    TapeRequestError::OpenFailed(err.to_string()),
+                                )?;
                                 continue;
                             }
                         };
 
-                        match handle.read_label() {
+                        let request_error = match handle.read_label() {
+                            Ok((Some(media_id), _)) if media_id.label.uuid == label.uuid => {
+                                task_log!(
+                                    worker,
+                                    "found media label {} ({})",
+                                    media_id.label.label_text,
+                                    media_id.label.uuid.to_string(),
+                                );
+                                return Ok((Box::new(handle), media_id));
+                            }
                             Ok((Some(media_id), _)) => {
-                                if media_id.label.uuid == label.uuid {
-                                    task_log!(
-                                        worker,
-                                        "found media label {} ({})",
-                                        media_id.label.label_text,
-                                        media_id.label.uuid.to_string(),
-                                    );
-                                    return Ok((Box::new(handle), media_id));
-                                } else if Some(media_id.label.uuid.clone()) != last_media_uuid {
-                                    let err = format!(
-                                        "wrong media label {} ({})",
-                                        media_id.label.label_text,
-                                        media_id.label.uuid.to_string(),
-                                    );
-                                    task_log!(worker, "{}", err);
-                                    last_media_uuid = Some(media_id.label.uuid);
-                                    failure_reason = Some(err);
-                                }
+                                let label_string = format!(
+                                    "{} ({})",
+                                    media_id.label.label_text,
+                                    media_id.label.uuid.to_string(),
+                                );
+                                TapeRequestError::WrongLabel(label_string)
                             }
                             Ok((None, _)) => {
-                                if last_media_uuid.is_some() {
-                                    let err = "found empty media without label (please label all tapes first)";
-                                    task_log!(worker, "{}", err);
-                                    last_media_uuid = None;
-                                    failure_reason = Some(err.to_string());
-                                }
+                                TapeRequestError::EmptyTape
                             }
                             Err(err) => {
-                                let err = err.to_string();
-                                if Some(err.clone()) != last_error {
-                                    task_log!(worker, "tape open failed - {}", err);
-                                    last_error = Some(err);
-                                    failure_reason = last_error.clone();
-                                }
+                                TapeRequestError::ReadFailed(err.to_string())
                             }
-                        }
+                        };
+
+                        update_and_log_request_error(&mut last_error, request_error)?;
                     }
                 }
                 _ => bail!("drive type '{}' not implemented!"),
@@ -474,16 +514,34 @@ pub fn request_and_load_media(
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum TapeLockError {
+    #[error("timeout while trying to lock")]
+    TimeOut,
+    #[error("{0}")]
+    Other(#[from] Error),
+}
+
+impl From<std::io::Error> for TapeLockError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+
 /// Acquires an exclusive lock for the tape device
 ///
 /// Basically calls lock_device_path() using the configured drive path.
 pub fn lock_tape_device(
     config: &SectionConfigData,
     drive: &str,
-) -> Result<DeviceLockGuard, Error> {
+) -> Result<DeviceLockGuard, TapeLockError> {
     let path = tape_device_path(config, drive)?;
-    lock_device_path(&path)
-        .map_err(|err| format_err!("unable to lock drive '{}' - {}", drive, err))
+    lock_device_path(&path).map_err(|err| match err {
+        TapeLockError::Other(err) => {
+            TapeLockError::Other(format_err!("unable to lock drive '{}' - {}", drive, err))
+        }
+        other => other,
+    })
 }
 
 /// Writes the given state for the specified drive
@@ -512,7 +570,7 @@ pub fn get_tape_device_state(
     config: &SectionConfigData,
     drive: &str,
 ) -> Result<Option<String>, Error> {
-    let path = format!("/run/proxmox-backup/drive-state/{}", drive);
+    let path = format!("{}/{}", crate::tape::DRIVE_STATE_DIR, drive);
     let state = file_read_optional_string(path)?;
 
     let device_path = tape_device_path(config, drive)?;
@@ -548,23 +606,40 @@ fn tape_device_path(
 
 pub struct DeviceLockGuard(std::fs::File);
 
-// Acquires an exclusive lock on `device_path`
-//
 // Uses systemd escape_unit to compute a file name from `device_path`, the try
 // to lock `/var/lock/<name>`.
-fn lock_device_path(device_path: &str) -> Result<DeviceLockGuard, Error> {
-
+fn open_device_lock(device_path: &str) -> Result<std::fs::File, Error> {
     let lock_name = crate::tools::systemd::escape_unit(device_path, true);
 
-    let mut path = std::path::PathBuf::from("/var/lock");
+    let mut path = std::path::PathBuf::from(crate::tape::DRIVE_LOCK_DIR);
     path.push(lock_name);
 
-    let timeout = std::time::Duration::new(10, 0);
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    proxmox::tools::fs::lock_file(&mut file, true, Some(timeout))?;
+    let user = crate::backup::backup_user()?;
+    let options = CreateOptions::new()
+        .perm(Mode::from_bits_truncate(0o660))
+        .owner(user.uid)
+        .group(user.gid);
 
-    let backup_user = crate::backup::backup_user()?;
-    fchown(file.as_raw_fd(), Some(backup_user.uid), Some(backup_user.gid))?;
+    atomic_open_or_create_file(
+        path,
+        OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_APPEND,
+        &[],
+        options,
+    )
+}
+
+// Acquires an exclusive lock on `device_path`
+//
+fn lock_device_path(device_path: &str) -> Result<DeviceLockGuard, TapeLockError> {
+    let mut file = open_device_lock(device_path)?; 
+    let timeout = std::time::Duration::new(10, 0);
+    if let Err(err) = lock_file(&mut file, true, Some(timeout)) {
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Err(TapeLockError::TimeOut);
+        } else {
+            return Err(err.into());
+        }
+    }
 
     Ok(DeviceLockGuard(file))
 }
@@ -573,23 +648,16 @@ fn lock_device_path(device_path: &str) -> Result<DeviceLockGuard, Error> {
 // non-blocking, and returning if the file is locked or not
 fn test_device_path_lock(device_path: &str) -> Result<bool, Error> {
 
-    let lock_name = crate::tools::systemd::escape_unit(device_path, true);
-
-    let mut path = std::path::PathBuf::from("/var/lock");
-    path.push(lock_name);
+    let mut file = open_device_lock(device_path)?; 
 
     let timeout = std::time::Duration::new(0, 0);
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    match proxmox::tools::fs::lock_file(&mut file, true, Some(timeout)) {
+    match lock_file(&mut file, true, Some(timeout)) {
         // file was not locked, continue
         Ok(()) => {},
         // file was locked, return true
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
         Err(err) => bail!("{}", err),
     }
-
-    let backup_user = crate::backup::backup_user()?;
-    fchown(file.as_raw_fd(), Some(backup_user.uid), Some(backup_user.gid))?;
 
     Ok(false)
 }

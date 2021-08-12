@@ -25,14 +25,10 @@ use proxmox::{
             SectionConfigPlugin,
         },
     },
-    tools::fs::{
-        open_file_locked,
-        replace_file,
-        CreateOptions,
-    },
 };
 
 use crate::{
+    backup::{open_backup_lockfile, BackupLockGuard},
     api2::types::{
         DRIVE_NAME_SCHEMA,
         VirtualTapeDrive,
@@ -79,8 +75,8 @@ pub const DRIVE_CFG_FILENAME: &str = "/etc/proxmox-backup/tape.cfg";
 pub const DRIVE_CFG_LOCKFILE: &str = "/etc/proxmox-backup/.tape.lck";
 
 /// Get exclusive lock
-pub fn lock() -> Result<std::fs::File, Error> {
-    open_file_locked(DRIVE_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)
+pub fn lock() -> Result<BackupLockGuard, Error> {
+    open_backup_lockfile(DRIVE_CFG_LOCKFILE, None, true)
 }
 
 /// Read and parse the configuration file
@@ -97,19 +93,7 @@ pub fn config() -> Result<(SectionConfigData, [u8;32]), Error> {
 /// Save the configuration file
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(DRIVE_CFG_FILENAME, &config)?;
-
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(DRIVE_CFG_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(DRIVE_CFG_FILENAME, raw.as_bytes())
 }
 
 /// Check if the specified drive name exists in the config.

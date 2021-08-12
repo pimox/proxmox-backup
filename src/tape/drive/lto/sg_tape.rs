@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::convert::TryFrom;
 
 use anyhow::{bail, format_err, Error};
 use endian_trait::Endian;
@@ -122,13 +123,14 @@ pub struct LtoTapeStatus {
 
 pub struct SgTape {
     file: File,
+    locate_offset: Option<i64>,
     info: InquiryInfo,
     encryption_key_loaded: bool,
 }
 
 impl SgTape {
 
-    const SCSI_TAPE_DEFAULT_TIMEOUT: usize = 60*2; // 2 minutes
+    const SCSI_TAPE_DEFAULT_TIMEOUT: usize = 60*10; // 10 minutes
 
     /// Create a new instance
     ///
@@ -145,6 +147,7 @@ impl SgTape {
             file,
             info,
             encryption_key_loaded: false,
+            locate_offset: None,
         })
     }
 
@@ -295,6 +298,84 @@ impl SgTape {
         Ok(())
     }
 
+    pub fn locate_file(&mut self, position: u64) ->  Result<(), Error> {
+        if position == 0 {
+            return self.rewind();
+        }
+
+        const SPACE_ONE_FILEMARK: &[u8] = &[0x11, 0x01, 0, 0, 1, 0];
+
+        // Special case for position 1, because LOCATE 0 does not work
+        if position == 1 {
+            self.rewind()?;
+            let mut sg_raw = SgRaw::new(&mut self.file, 16)?;
+            sg_raw.set_timeout(Self::SCSI_TAPE_DEFAULT_TIMEOUT);
+            sg_raw.do_command(SPACE_ONE_FILEMARK)
+                .map_err(|err| format_err!("locate file {} (space) failed - {}", position, err))?;
+            return Ok(());
+        }
+
+        let mut sg_raw = SgRaw::new(&mut self.file, 16)?;
+        sg_raw.set_timeout(Self::SCSI_TAPE_DEFAULT_TIMEOUT);
+
+        // Note: LOCATE(16) works for LTO4 or newer
+        //
+        // It seems the LOCATE command behaves slightly different across vendors
+        // e.g. for IBM drives, LOCATE 1 moves to File #2, but
+        // for HP drives, LOCATE 1 move to File #1
+
+        let fixed_position = if let Some(locate_offset) = self.locate_offset {
+            if locate_offset < 0 {
+                position.saturating_sub((-locate_offset) as u64)
+            } else {
+                position.saturating_add(locate_offset as u64)
+            }
+        } else {
+            position
+        };
+        // always sub(1), so that it works for IBM drives without locate_offset
+        let fixed_position = fixed_position.saturating_sub(1);
+
+        let mut cmd = Vec::new();
+        cmd.extend(&[0x92, 0b000_01_000, 0, 0]); // LOCATE(16) filemarks
+        cmd.extend(&fixed_position.to_be_bytes());
+        cmd.extend(&[0, 0, 0, 0]);
+
+        sg_raw.do_command(&cmd)
+            .map_err(|err| format_err!("locate file {} failed - {}", position, err))?;
+
+        // LOCATE always position at the BOT side of the filemark, so
+        // we need to move to other side of filemark
+        sg_raw.do_command(SPACE_ONE_FILEMARK)
+            .map_err(|err| format_err!("locate file {} (space) failed - {}", position, err))?;
+
+        if self.locate_offset.is_none() {
+            // check if we landed at correct position
+            let current_file = self.current_file_number()?;
+            if current_file != position {
+                let offset: i64 =
+                    i64::try_from((position as i128) - (current_file as i128)).map_err(|err| {
+                        format_err!(
+                            "locate_file: offset between {} and {} invalid: {}",
+                            position,
+                            current_file,
+                            err
+                        )
+                    })?;
+                self.locate_offset = Some(offset);
+                self.locate_file(position)?;
+                let current_file = self.current_file_number()?;
+                if current_file != position {
+                    bail!("locate_file: compensating offset did not work, aborting...");
+                }
+            } else {
+                self.locate_offset = Some(0);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn position(&mut self) -> Result<ReadPositionLongPage, Error> {
 
         let expected_size = std::mem::size_of::<ReadPositionLongPage>();
@@ -302,6 +383,9 @@ impl SgTape {
         let mut sg_raw = SgRaw::new(&mut self.file, 32)?;
         sg_raw.set_timeout(30); // use short timeout
         let mut cmd = Vec::new();
+        // READ POSITION LONG FORM works on LTO4 or newer (with recent
+        // firmware), although it is missing in the IBM LTO4 SSCI
+        // reference manual.
         cmd.extend(&[0x34, 0x06, 0, 0, 0, 0, 0, 0, 0, 0]); // READ POSITION LONG FORM
 
         let data = sg_raw.do_command(&cmd)

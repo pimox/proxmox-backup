@@ -22,8 +22,9 @@ use proxmox::{
     },
 };
 
+use pbs_datastore::task_log;
+
 use crate::{
-    task_log,
     config::{
         self,
         cached_user_info::CachedUserInfo,
@@ -719,7 +720,7 @@ pub async fn read_label(
                         flat.encryption_key_fingerprint = set
                             .encryption_key_fingerprint
                             .as_ref()
-                            .map(|fp| crate::tools::format::as_fingerprint(fp.bytes()));
+                            .map(|fp| pbs_tools::format::as_fingerprint(fp.bytes()));
 
                         let encrypt_fingerprint = set.encryption_key_fingerprint.clone()
                             .map(|fp| (fp, set.uuid.clone()));
@@ -1336,7 +1337,7 @@ pub fn catalog_media(
             drive.read_label()?; // skip over labels - we already read them above
 
             let mut checked_chunks = HashMap::new();
-            restore_media(&worker, &mut drive, &media_id, None, &mut checked_chunks, verbose)?;
+            restore_media(worker, &mut drive, &media_id, None, &mut checked_chunks, verbose)?;
 
             Ok(())
         },

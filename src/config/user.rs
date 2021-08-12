@@ -3,10 +3,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Error};
 use lazy_static::lazy_static;
-use serde::{Serialize, Deserialize};
 
 use proxmox::api::{
-    api,
     schema::*,
     section_config::{
         SectionConfig,
@@ -15,121 +13,16 @@ use proxmox::api::{
     }
 };
 
-use proxmox::tools::{fs::replace_file, fs::CreateOptions};
+use pbs_api_types::{Authid, Userid};
+pub use pbs_api_types::{ApiToken, User};
+pub use pbs_api_types::{
+    EMAIL_SCHEMA, ENABLE_USER_SCHEMA, EXPIRE_USER_SCHEMA, FIRST_NAME_SCHEMA, LAST_NAME_SCHEMA,
+};
 
-use crate::api2::types::*;
+use crate::tools::Memcom;
 
 lazy_static! {
     pub static ref CONFIG: SectionConfig = init();
-}
-
-pub const ENABLE_USER_SCHEMA: Schema = BooleanSchema::new(
-    "Enable the account (default). You can set this to '0' to disable the account.")
-    .default(true)
-    .schema();
-
-pub const EXPIRE_USER_SCHEMA: Schema = IntegerSchema::new(
-    "Account expiration date (seconds since epoch). '0' means no expiration date.")
-    .default(0)
-    .minimum(0)
-    .schema();
-
-pub const FIRST_NAME_SCHEMA: Schema = StringSchema::new("First name.")
-    .format(&SINGLE_LINE_COMMENT_FORMAT)
-    .min_length(2)
-    .max_length(64)
-    .schema();
-
-pub const LAST_NAME_SCHEMA: Schema = StringSchema::new("Last name.")
-    .format(&SINGLE_LINE_COMMENT_FORMAT)
-    .min_length(2)
-    .max_length(64)
-    .schema();
-
-pub const EMAIL_SCHEMA: Schema = StringSchema::new("E-Mail Address.")
-    .format(&SINGLE_LINE_COMMENT_FORMAT)
-    .min_length(2)
-    .max_length(64)
-    .schema();
-
-#[api(
-    properties: {
-        tokenid: {
-            schema: PROXMOX_TOKEN_ID_SCHEMA,
-        },
-        comment: {
-            optional: true,
-            schema: SINGLE_LINE_COMMENT_SCHEMA,
-        },
-        enable: {
-            optional: true,
-            schema: ENABLE_USER_SCHEMA,
-        },
-        expire: {
-            optional: true,
-            schema: EXPIRE_USER_SCHEMA,
-        },
-    }
-)]
-#[derive(Serialize,Deserialize)]
-/// ApiToken properties.
-pub struct ApiToken {
-    pub tokenid: Authid,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub enable: Option<bool>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub expire: Option<i64>,
-}
-
-#[api(
-    properties: {
-        userid: {
-            type: Userid,
-        },
-        comment: {
-            optional: true,
-            schema: SINGLE_LINE_COMMENT_SCHEMA,
-        },
-        enable: {
-            optional: true,
-            schema: ENABLE_USER_SCHEMA,
-        },
-        expire: {
-            optional: true,
-            schema: EXPIRE_USER_SCHEMA,
-        },
-        firstname: {
-            optional: true,
-            schema: FIRST_NAME_SCHEMA,
-        },
-        lastname: {
-            schema: LAST_NAME_SCHEMA,
-            optional: true,
-         },
-        email: {
-            schema: EMAIL_SCHEMA,
-            optional: true,
-        },
-    }
-)]
-#[derive(Serialize,Deserialize)]
-/// User properties.
-pub struct User {
-    pub userid: Userid,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub enable: Option<bool>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub expire: Option<i64>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub firstname: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub lastname: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub email: Option<String>,
 }
 
 fn init() -> SectionConfig {
@@ -226,17 +119,12 @@ pub fn cached_config() -> Result<Arc<SectionConfigData>, Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(USER_CFG_FILENAME, &config)?;
+    crate::backup::replace_backup_config(USER_CFG_FILENAME, raw.as_bytes())?;
 
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(USER_CFG_FILENAME, raw.as_bytes(), options)?;
+    // increase user cache generation
+    // We use this in CachedUserInfo
+    let memcom = Memcom::new()?;
+    memcom.increase_user_cache_generation();
 
     Ok(())
 }

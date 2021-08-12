@@ -3,10 +3,11 @@ use serde_json::{json, Value};
 
 use proxmox::api::{api, cli::*};
 
-use proxmox_backup::tools;
+use pbs_client::display_task_log;
+use pbs_tools::percent_encoding::percent_encode_component;
+use pbs_tools::json::required_string_param;
 
-use proxmox_backup::client::*;
-use proxmox_backup::api2::types::UPID_SCHEMA;
+use pbs_api_types::UPID;
 
 use crate::{
     REPO_URL_SCHEMA,
@@ -66,11 +67,12 @@ async fn task_list(param: Value) -> Result<Value, Error> {
 
     let return_type = &proxmox_backup::api2::node::tasks::API_METHOD_LIST_TASKS.returns;
 
+    use pbs_tools::format::{render_epoch, render_task_status};
     let options = default_table_format_options()
-        .column(ColumnConfig::new("starttime").right_align(false).renderer(tools::format::render_epoch))
-        .column(ColumnConfig::new("endtime").right_align(false).renderer(tools::format::render_epoch))
+        .column(ColumnConfig::new("starttime").right_align(false).renderer(render_epoch))
+        .column(ColumnConfig::new("endtime").right_align(false).renderer(render_epoch))
         .column(ColumnConfig::new("upid"))
-        .column(ColumnConfig::new("status").renderer(tools::format::render_task_status));
+        .column(ColumnConfig::new("status").renderer(render_task_status));
 
     format_and_print_result_full(&mut data, return_type, &output_format, &options);
 
@@ -85,7 +87,7 @@ async fn task_list(param: Value) -> Result<Value, Error> {
                 optional: true,
             },
             upid: {
-                schema: UPID_SCHEMA,
+                type: UPID,
             },
         }
     }
@@ -94,7 +96,7 @@ async fn task_list(param: Value) -> Result<Value, Error> {
 async fn task_log(param: Value) -> Result<Value, Error> {
 
     let repo = extract_repository_from_value(&param)?;
-    let upid =  tools::required_string_param(&param, "upid")?;
+    let upid =  required_string_param(&param, "upid")?;
 
     let mut client = connect(&repo)?;
 
@@ -111,7 +113,7 @@ async fn task_log(param: Value) -> Result<Value, Error> {
                 optional: true,
             },
             upid: {
-                schema: UPID_SCHEMA,
+                type: UPID,
             },
         }
     }
@@ -120,11 +122,11 @@ async fn task_log(param: Value) -> Result<Value, Error> {
 async fn task_stop(param: Value) -> Result<Value, Error> {
 
     let repo = extract_repository_from_value(&param)?;
-    let upid_str =  tools::required_string_param(&param, "upid")?;
+    let upid_str =  required_string_param(&param, "upid")?;
 
     let mut client = connect(&repo)?;
 
-    let path = format!("api2/json/nodes/localhost/tasks/{}", tools::percent_encode_component(upid_str));
+    let path = format!("api2/json/nodes/localhost/tasks/{}", percent_encode_component(upid_str));
     let _ = client.delete(&path, None).await?;
 
     Ok(Value::Null)

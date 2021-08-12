@@ -53,6 +53,8 @@ JSSRC=							\
 	config/SyncView.js				\
 	config/VerifyView.js				\
 	config/WebauthnView.js				\
+	config/CertificateView.js			\
+	config/NodeOptionView.js			\
 	window/ACLEdit.js				\
 	window/AddTfaRecovery.js			\
 	window/AddTotp.js				\
@@ -76,11 +78,11 @@ JSSRC=							\
 	dashboard/LongestTasks.js			\
 	dashboard/RunningTasks.js			\
 	dashboard/TaskSummary.js			\
-	panel/Tasks.js					\
 	panel/XtermJsConsole.js				\
 	panel/AccessControl.js				\
 	panel/StorageAndDisks.js			\
 	panel/UsageChart.js				\
+	panel/NodeInfo.js				\
 	ZFSList.js					\
 	DirectoryList.js				\
 	LoginView.js					\

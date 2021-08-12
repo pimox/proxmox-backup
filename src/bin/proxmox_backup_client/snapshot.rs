@@ -8,17 +8,11 @@ use proxmox::{
     tools::fs::file_get_contents,
 };
 
-use proxmox_backup::{
-    tools,
-    api2::types::*,
-    backup::{
-        CryptMode,
-        CryptConfig,
-        DataBlob,
-        BackupGroup,
-        decrypt_key,
-    }
-};
+use pbs_api_types::SnapshotListItem;
+use pbs_client::tools::key_source::get_encryption_key_password;
+use pbs_datastore::{BackupGroup, CryptMode, CryptConfig, decrypt_key};
+use pbs_datastore::data_blob::DataBlob;
+use pbs_tools::json::required_string_param;
 
 use crate::{
     REPO_URL_SCHEMA,
@@ -34,8 +28,6 @@ use crate::{
     extract_repository_from_value,
     record_repository,
 };
-
-use crate::proxmox_client_tools::key_source::get_encryption_key_password;
 
 #[api(
    input: {
@@ -87,7 +79,7 @@ async fn list_snapshots(param: Value) -> Result<Value, Error> {
         for file in &item.files {
             filenames.push(file.filename.to_string());
         }
-        Ok(tools::format::render_backup_file_list(&filenames[..]))
+        Ok(pbs_tools::format::render_backup_file_list(&filenames[..]))
     };
 
     let options = default_table_format_options()
@@ -95,7 +87,7 @@ async fn list_snapshots(param: Value) -> Result<Value, Error> {
         .sortby("backup-id", false)
         .sortby("backup-time", false)
         .column(ColumnConfig::new("backup-id").renderer(render_snapshot_path).header("snapshot"))
-        .column(ColumnConfig::new("size").renderer(tools::format::render_bytes_human_readable))
+        .column(ColumnConfig::new("size").renderer(pbs_tools::format::render_bytes_human_readable))
         .column(ColumnConfig::new("files").renderer(render_files))
         ;
 
@@ -129,7 +121,7 @@ async fn list_snapshot_files(param: Value) -> Result<Value, Error> {
 
     let repo = extract_repository_from_value(&param)?;
 
-    let path = tools::required_string_param(&param, "snapshot")?;
+    let path = required_string_param(&param, "snapshot")?;
     let snapshot: BackupDir = path.parse()?;
 
     let output_format = get_output_format(&param);
@@ -177,7 +169,7 @@ async fn forget_snapshots(param: Value) -> Result<Value, Error> {
 
     let repo = extract_repository_from_value(&param)?;
 
-    let path = tools::required_string_param(&param, "snapshot")?;
+    let path = required_string_param(&param, "snapshot")?;
     let snapshot: BackupDir = path.parse()?;
 
     let mut client = connect(&repo)?;
@@ -228,10 +220,10 @@ async fn forget_snapshots(param: Value) -> Result<Value, Error> {
 /// Upload backup log file.
 async fn upload_log(param: Value) -> Result<Value, Error> {
 
-    let logfile = tools::required_string_param(&param, "logfile")?;
+    let logfile = required_string_param(&param, "logfile")?;
     let repo = extract_repository_from_value(&param)?;
 
-    let snapshot = tools::required_string_param(&param, "snapshot")?;
+    let snapshot = required_string_param(&param, "snapshot")?;
     let snapshot: BackupDir = snapshot.parse()?;
 
     let mut client = connect(&repo)?;
@@ -291,7 +283,7 @@ async fn upload_log(param: Value) -> Result<Value, Error> {
 /// Show notes
 async fn show_notes(param: Value) -> Result<Value, Error> {
     let repo = extract_repository_from_value(&param)?;
-    let path = tools::required_string_param(&param, "snapshot")?;
+    let path = required_string_param(&param, "snapshot")?;
 
     let snapshot: BackupDir = path.parse()?;
     let client = connect(&repo)?;
@@ -347,8 +339,8 @@ async fn show_notes(param: Value) -> Result<Value, Error> {
 /// Update Notes
 async fn update_notes(param: Value) -> Result<Value, Error> {
     let repo = extract_repository_from_value(&param)?;
-    let path = tools::required_string_param(&param, "snapshot")?;
-    let notes = tools::required_string_param(&param, "notes")?;
+    let path = required_string_param(&param, "snapshot")?;
+    let notes = required_string_param(&param, "notes")?;
 
     let snapshot: BackupDir = path.parse()?;
     let mut client = connect(&repo)?;
@@ -412,8 +404,8 @@ pub fn snapshot_mgtm_cli() -> CliCommandMap {
             CliCommand::new(&API_METHOD_UPLOAD_LOG)
                 .arg_param(&["snapshot", "logfile"])
                 .completion_cb("snapshot", complete_backup_snapshot)
-                .completion_cb("logfile", tools::complete_file_name)
-                .completion_cb("keyfile", tools::complete_file_name)
+                .completion_cb("logfile", pbs_tools::fs::complete_file_name)
+                .completion_cb("keyfile", pbs_tools::fs::complete_file_name)
                 .completion_cb("repository", complete_repository)
         )
 }

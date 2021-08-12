@@ -23,11 +23,7 @@ use crate::{
     },
     tools::sgutils2::{
         SgRaw,
-        SENSE_KEY_NO_SENSE,
-        SENSE_KEY_RECOVERED_ERROR,
-        SENSE_KEY_UNIT_ATTENTION,
         SENSE_KEY_NOT_READY,
-        InquiryInfo,
         ScsiError,
         scsi_ascii_to_string,
         scsi_inquiry,
@@ -36,6 +32,7 @@ use crate::{
 };
 
 const SCSI_CHANGER_DEFAULT_TIMEOUT: usize = 60*5; // 5 minutes
+const SCSI_VOLUME_TAG_LEN: usize = 36;
 
 /// Initialize element status (Inventory)
 pub fn initialize_element_status<F: AsRawFd>(file: &mut F) -> Result<(), Error> {
@@ -77,11 +74,10 @@ struct AddressAssignmentPage {
 }
 
 /// Execute scsi commands, optionally repeat the command until
-/// successful (sleep 1 second between invovations)
+/// successful or timeout (sleep 1 second between invovations)
 ///
-/// Any Sense key other than NO_SENSE, RECOVERED_ERROR, NOT_READY and
-/// UNIT_ATTENTION aborts the loop and returns an error. If the device
-/// reports "Not Ready - becoming ready", we wait up to 5 minutes.
+/// Timeout is 5 seconds. If the device reports "Not Ready - becoming
+/// ready", we wait up to 5 minutes.
 ///
 /// Skipped errors are printed on stderr.
 fn execute_scsi_command<F: AsRawFd>(
@@ -100,42 +96,33 @@ fn execute_scsi_command<F: AsRawFd>(
     loop {
         match sg_raw.do_command(&cmd) {
             Ok(data) => return Ok(data.to_vec()),
+            Err(err) if !retry => bail!("{} failed: {}", error_prefix, err),
             Err(err) => {
-                if !retry {
-                    bail!("{} failed: {}", error_prefix, err);
+                let msg = err.to_string();
+                if let Some(ref last) = last_msg {
+                    if &msg != last {
+                        eprintln!("{}", err);
+                        last_msg = Some(msg);
+                    }
+                } else {
+                    eprintln!("{}", err);
+                    last_msg = Some(msg);
                 }
+
                 if let ScsiError::Sense(ref sense) = err {
-
-                    if sense.sense_key == SENSE_KEY_NO_SENSE ||
-                        sense.sense_key == SENSE_KEY_RECOVERED_ERROR ||
-                        sense.sense_key == SENSE_KEY_UNIT_ATTENTION ||
-                        sense.sense_key == SENSE_KEY_NOT_READY
-                    {
-                        let msg = err.to_string();
-                        if let Some(ref last) = last_msg {
-                            if &msg != last {
-                                eprintln!("{}", err);
-                                last_msg = Some(msg);
-                            }
-                        } else {
-                            eprintln!("{}", err);
-                            last_msg = Some(msg);
-                        }
-
-                        // Not Ready - becoming ready
-                        if sense.sense_key == SENSE_KEY_NOT_READY && sense.asc == 0x04 && sense.ascq == 1 {
-                            // wait up to 5 minutes, long enough to finish inventorize
-                            timeout = std::time::Duration::new(5*60, 0);
-                        }
-
-                        if start.elapsed()? > timeout {
-                            bail!("{} failed: {}", error_prefix, err);
-                        }
-
-                        std::thread::sleep(std::time::Duration::new(1, 0));
-                        continue; // try again
+                    // Not Ready - becoming ready
+                    if sense.sense_key == SENSE_KEY_NOT_READY && sense.asc == 0x04 && sense.ascq == 1 {
+                        // wait up to 5 minutes, long enough to finish inventorize
+                        timeout = std::time::Duration::new(5*60, 0);
                     }
                 }
+
+                if start.elapsed()? > timeout {
+                    bail!("{} failed: {}", error_prefix, err);
+                }
+
+                std::thread::sleep(std::time::Duration::new(1, 0));
+                continue; // try again
             }
         }
    }
@@ -278,24 +265,109 @@ pub fn transfer_medium<F: AsRawFd>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ElementType {
+    MediumTransport,
+    Storage,
+    ImportExport,
+    DataTransfer,
+    DataTransferWithDVCID,
+}
+
+impl ElementType {
+    fn byte1(&self) -> u8 {
+        let volume_tag_bit = 1u8 << 4;
+        match *self {
+            ElementType::MediumTransport => volume_tag_bit | 1,
+            ElementType::Storage => volume_tag_bit | 2,
+            ElementType::ImportExport => volume_tag_bit | 3,
+            ElementType::DataTransfer => volume_tag_bit | 4,
+            // some changers cannot get voltag + dvcid at the same time
+            ElementType::DataTransferWithDVCID => 4,
+        }
+    }
+
+    fn byte6(&self) -> u8 {
+        match *self {
+            ElementType::DataTransferWithDVCID => 0b001, //  Mixed=0,CurData=0,DVCID=1
+            _ => 0b000, // Mixed=0,CurData=0,DVCID=0
+        }
+    }
+}
+
 fn scsi_read_element_status_cdb(
     start_element_address: u16,
+    number_of_elements: u16,
+    element_type: ElementType,
     allocation_len: u32,
 ) -> Vec<u8> {
 
     let mut cmd = Vec::new();
     cmd.push(0xB8); // READ ELEMENT STATUS (B8h)
-    cmd.push(1u8<<4); // report all types and volume tags
+    cmd.push(element_type.byte1());
     cmd.extend(&start_element_address.to_be_bytes());
 
-    let number_of_elements: u16 = 0xffff;
     cmd.extend(&number_of_elements.to_be_bytes());
-    cmd.push(0b001); //  Mixed=0,CurData=0,DVCID=1
+    cmd.push(element_type.byte6());
     cmd.extend(&allocation_len.to_be_bytes()[1..4]);
     cmd.push(0);
     cmd.push(0);
 
     cmd
+}
+
+// query a single element type from the changer
+fn get_element<F: AsRawFd>(
+    sg_raw: &mut SgRaw<F>,
+    element_type: ElementType,
+    allocation_len: u32,
+    mut retry: bool,
+) -> Result<DecodedStatusPage, Error> {
+
+    let mut start_element_address = 0;
+    let number_of_elements: u16 = 1000; // some changers limit the query
+
+    let mut result = DecodedStatusPage {
+        last_element_address: None,
+        transports: Vec::new(),
+        drives: Vec::new(),
+        storage_slots: Vec::new(),
+        import_export_slots: Vec::new(),
+    };
+
+    loop {
+        let cmd = scsi_read_element_status_cdb(start_element_address, number_of_elements, element_type, allocation_len);
+
+        let data = execute_scsi_command(sg_raw, &cmd, "read element status (B8h)", retry)?;
+
+        let page = decode_element_status_page(&data, start_element_address)?;
+
+        retry = false; // only retry the first command
+
+        let returned_number_of_elements = page.transports.len()
+            + page.drives.len()
+            + page.storage_slots.len()
+            + page.import_export_slots.len();
+
+        result.transports.extend(page.transports);
+        result.drives.extend(page.drives);
+        result.storage_slots.extend(page.storage_slots);
+        result.import_export_slots.extend(page.import_export_slots);
+        result.last_element_address = page.last_element_address;
+
+        if let Some(last_element_address) = page.last_element_address {
+            if last_element_address < start_element_address {
+                bail!("got strange element address");
+            }
+            if returned_number_of_elements >= (number_of_elements as usize) {
+                start_element_address = last_element_address + 1;
+                continue; // we possibly have to read additional elements
+            }
+        }
+        break;
+    }
+
+    Ok(result)
 }
 
 /// Read element status.
@@ -315,55 +387,70 @@ pub fn read_element_status<F: AsRawFd>(file: &mut F) -> Result<MtxStatus, Error>
     let mut sg_raw = SgRaw::new(file, allocation_len as usize)?;
     sg_raw.set_timeout(SCSI_CHANGER_DEFAULT_TIMEOUT);
 
-    let mut start_element_address = 0;
-
     let mut drives = Vec::new();
     let mut storage_slots = Vec::new();
     let mut import_export_slots = Vec::new();
     let mut transports = Vec::new();
 
-    let mut retry = true;
+    let page = get_element(&mut sg_raw, ElementType::Storage, allocation_len, true)?;
+    storage_slots.extend(page.storage_slots);
 
-    loop {
-        let cmd = scsi_read_element_status_cdb(start_element_address, allocation_len);
+    let page = get_element(&mut sg_raw, ElementType::ImportExport, allocation_len, false)?;
+    import_export_slots.extend(page.import_export_slots);
 
-        let data = execute_scsi_command(&mut sg_raw, &cmd, "read element status (B8h)", retry)?;
+    let page = get_element(&mut sg_raw, ElementType::DataTransfer, allocation_len, false)?;
+    drives.extend(page.drives);
 
-        let page = decode_element_status_page(&inquiry, &data, start_element_address)?;
-
-        retry = false; // only retry the first command
-
-        transports.extend(page.transports);
-        drives.extend(page.drives);
-        storage_slots.extend(page.storage_slots);
-        import_export_slots.extend(page.import_export_slots);
-
-        if data.len() < (allocation_len as usize) {
-            break;
-        }
-
-        if let Some(last_element_address) = page.last_element_address {
-            if last_element_address >= start_element_address {
-                start_element_address = last_element_address + 1;
-            } else {
-                bail!("got strange element address");
+    // get the serial + vendor + model,
+    // some changer require this to be an extra scsi command
+    let page = get_element(&mut sg_raw, ElementType::DataTransferWithDVCID, allocation_len, false)?;
+    // should be in same order and same count, but be on the safe side.
+    // there should not be too many drives normally
+    for drive in drives.iter_mut() {
+        for drive2 in &page.drives {
+            if drive2.element_address == drive.element_address {
+                drive.vendor = drive2.vendor.clone();
+                drive.model = drive2.model.clone();
+                drive.drive_serial_number = drive2.drive_serial_number.clone();
             }
-        } else {
-            break;
         }
     }
 
-    if (setup.transport_element_count as usize) != transports.len() {
-        bail!("got wrong number of transport elements");
+    let page = get_element(&mut sg_raw, ElementType::MediumTransport, allocation_len, false)?;
+    transports.extend(page.transports);
+
+    let transport_count = setup.transport_element_count as usize;
+    let storage_count = setup.storage_element_count as usize;
+    let import_export_count = setup.import_export_element_count as usize;
+    let transfer_count = setup.transfer_element_count as usize;
+
+    if transport_count != transports.len() {
+        bail!(
+            "got wrong number of transport elements: expoected {}, got{}",
+            transport_count,
+            transports.len()
+        );
     }
-    if (setup.storage_element_count as usize) != storage_slots.len() {
-        bail!("got wrong number of storage elements");
+    if storage_count != storage_slots.len() {
+        bail!(
+            "got wrong number of storage elements: expected {}, got {}",
+            storage_count,
+            storage_slots.len(),
+        );
     }
-    if (setup.import_export_element_count as usize) != import_export_slots.len() {
-        bail!("got wrong number of import/export elements");
+    if import_export_count != import_export_slots.len() {
+        bail!(
+            "got wrong number of import/export elements: expected {}, got {}",
+            import_export_count,
+            import_export_slots.len(),
+        );
     }
-    if (setup.transfer_element_count as usize) != drives.len() {
-        bail!("got wrong number of transfer elements");
+    if transfer_count != drives.len() {
+        bail!(
+            "got wrong number of transfer elements: expected {}, got {}",
+            transfer_count,
+            drives.len(),
+        );
     }
 
     // create same virtual slot order as mtx(1)
@@ -442,7 +529,7 @@ impl SubHeader {
     ) -> Result<Option<String>, Error> {
 
         if (self.flags & 128) != 0 { // has PVolTag
-            let tmp = reader.read_exact_allocated(36)?;
+            let tmp = reader.read_exact_allocated(SCSI_VOLUME_TAG_LEN)?;
             if full {
                 let volume_tag = scsi_ascii_to_string(&tmp);
                 return Ok(Some(volume_tag));
@@ -459,7 +546,7 @@ impl SubHeader {
     ) -> Result<Option<String>, Error> {
 
         if (self.flags & 64) != 0 { // has AVolTag
-            let _tmp = reader.read_exact_allocated(36)?;
+            let _tmp = reader.read_exact_allocated(SCSI_VOLUME_TAG_LEN)?;
         }
 
         Ok(None)
@@ -468,7 +555,7 @@ impl SubHeader {
 
 #[repr(C, packed)]
 #[derive(Endian)]
-struct TrasnsportDescriptor { // Robot/Griper
+struct TransportDescriptor { // Robot/Griper
     element_address: u16,
     flags1: u8,
     reserved_3: u8,
@@ -541,8 +628,44 @@ fn create_element_status(full: bool, volume_tag: Option<String>) -> ElementStatu
     }
 }
 
+struct DvcidInfo {
+    vendor: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+}
+
+fn decode_dvcid_info<R: Read>(reader: &mut R) -> Result<DvcidInfo, Error> {
+    let dvcid: DvcidHead = unsafe { reader.read_be_value()? };
+
+    let (serial, vendor, model) = match (dvcid.code_set, dvcid.identifier_type) {
+        (2, 0) => { // Serial number only (Quantum Superloader3 uses this)
+            let serial = reader.read_exact_allocated(dvcid.identifier_len as usize)?;
+            let serial = scsi_ascii_to_string(&serial);
+            (Some(serial), None, None)
+        }
+        (2, 1) => {
+            if dvcid.identifier_len != 34 {
+                bail!("got wrong DVCID length");
+            }
+            let vendor = reader.read_exact_allocated(8)?;
+            let vendor = scsi_ascii_to_string(&vendor);
+            let model = reader.read_exact_allocated(16)?;
+            let model = scsi_ascii_to_string(&model);
+            let serial = reader.read_exact_allocated(10)?;
+            let serial = scsi_ascii_to_string(&serial);
+            (Some(serial), Some(vendor), Some(model))
+        }
+        _ => (None, None, None),
+    };
+
+    Ok(DvcidInfo {
+        vendor,
+        model,
+        serial,
+    })
+}
+
 fn decode_element_status_page(
-    _info: &InquiryInfo,
     data: &[u8],
     start_element_address: u16,
 ) -> Result<DecodedStatusPage, Error> {
@@ -569,6 +692,15 @@ fn decode_element_status_page(
             bail!("got wrong first_element_address_reported"); // sanity check
         }
 
+        let len = head.byte_count_of_report_available;
+        let len = ((len[0] as usize) << 16) + ((len[1] as usize) << 8) + (len[2] as usize);
+
+        if len < reader.len() {
+            reader = &reader[..len];
+        } else if len > reader.len() {
+            bail!("wrong amount of data: expected {}, got {}", len, reader.len());
+        }
+
         loop {
             if reader.is_empty() {
                 break;
@@ -583,29 +715,24 @@ fn decode_element_status_page(
             }
 
             let descr_data = reader.read_exact_allocated(len)?;
-            let mut reader = &descr_data[..];
 
-            loop {
-                if reader.is_empty() {
-                    break;
-                }
-                if reader.len() < (subhead.descriptor_length as usize) {
-                    break;
-                }
+            let descr_len = subhead.descriptor_length as usize;
 
-                let len_before = reader.len();
+            if descr_len == 0 {
+                bail!("got elements, but descriptor length 0");
+            }
+
+            for descriptor in descr_data.chunks_exact(descr_len) {
+                let mut reader = &descriptor[..];
 
                 match subhead.element_type_code {
                     1 => {
-                        let desc: TrasnsportDescriptor = unsafe { reader.read_be_value()? };
+                        let desc: TransportDescriptor = unsafe { reader.read_be_value()? };
 
                         let full = (desc.flags1 & 1) != 0;
                         let volume_tag = subhead.parse_optional_volume_tag(&mut reader, full)?;
 
                         subhead.skip_alternate_volume_tag(&mut reader)?;
-
-                        let mut reserved = [0u8; 4];
-                        reader.read_exact(&mut reserved)?;
 
                         result.last_element_address = Some(desc.element_address);
 
@@ -622,9 +749,6 @@ fn decode_element_status_page(
                         let volume_tag = subhead.parse_optional_volume_tag(&mut reader, full)?;
 
                         subhead.skip_alternate_volume_tag(&mut reader)?;
-
-                        let mut reserved = [0u8; 4];
-                        reader.read_exact(&mut reserved)?;
 
                         result.last_element_address = Some(desc.element_address);
 
@@ -658,55 +782,25 @@ fn decode_element_status_page(
 
                         subhead.skip_alternate_volume_tag(&mut reader)?;
 
-                        let dvcid: DvcidHead = unsafe { reader.read_be_value()? };
-
-                        let (drive_serial_number, vendor, model) = match (dvcid.code_set, dvcid.identifier_type) {
-                            (2, 0) => { // Serial number only (Quantum Superloader3 uses this)
-                                let serial = reader.read_exact_allocated(dvcid.identifier_len as usize)?;
-                                let serial = scsi_ascii_to_string(&serial);
-                                (Some(serial), None, None)
-                            }
-                            (2, 1) => {
-                                if dvcid.identifier_len != 34 {
-                                    bail!("got wrong DVCID length");
-                                }
-                                let vendor = reader.read_exact_allocated(8)?;
-                                let vendor = scsi_ascii_to_string(&vendor);
-                                let model = reader.read_exact_allocated(16)?;
-                                let model = scsi_ascii_to_string(&model);
-                                let serial = reader.read_exact_allocated(10)?;
-                                let serial = scsi_ascii_to_string(&serial);
-                                (Some(serial), Some(vendor), Some(model))
-                            }
-                            _ => (None, None, None),
-                        };
+                        let dvcid = decode_dvcid_info(&mut reader).unwrap_or(DvcidInfo {
+                            vendor: None,
+                            model: None,
+                            serial: None,
+                        });
 
                         result.last_element_address = Some(desc.element_address);
 
                         let drive = DriveStatus {
                             loaded_slot,
                             status: create_element_status(full, volume_tag),
-                            drive_serial_number,
-                            vendor,
-                            model,
+                            drive_serial_number: dvcid.serial,
+                            vendor: dvcid.vendor,
+                            model: dvcid.model,
                             element_address: desc.element_address,
                         };
                         result.drives.push(drive);
                     }
                     code => bail!("got unknown element type code {}", code),
-                }
-
-                // we have to consume the whole descriptor size, else
-                // our position in the reader is not correct
-                let len_after = reader.len();
-                let have_read = len_before - len_after;
-                let desc_len = subhead.descriptor_length as usize;
-                if desc_len > have_read {
-                    let mut left_to_read = desc_len - have_read;
-                    if left_to_read > len_after {
-                        left_to_read = len_after; // reader has not enough data?
-                    }
-                    let _ = reader.read_exact_allocated(left_to_read)?;
                 }
             }
         }
@@ -723,4 +817,142 @@ pub fn open<P: AsRef<Path>>(path: P) -> Result<File, Error> {
         .open(path)?;
 
     Ok(file)
+}
+
+#[cfg(test)]
+mod test {
+    use anyhow::Error;
+    use super::*;
+
+    struct StorageDesc {
+        address: u16,
+        pvoltag: Option<String>,
+    }
+
+    fn build_element_status_page(
+        descriptors: Vec<StorageDesc>,
+        trailing: &[u8],
+        element_type: u8,
+    ) -> Vec<u8> {
+        let descs: Vec<Vec<u8>> = descriptors.iter().map(|desc| {
+            build_storage_descriptor(&desc, trailing)
+        }).collect();
+
+        let (desc_len, address) = if let Some(el) = descs.get(0) {
+            (el.len() as u16, descriptors[0].address)
+        } else {
+            (0u16, 0u16)
+        };
+
+        let descriptor_byte_count = desc_len * descs.len() as u16;
+        let byte_count = 8 + descriptor_byte_count;
+
+        let mut res = Vec::new();
+
+        res.extend_from_slice(&address.to_be_bytes());
+        res.extend_from_slice(&(descs.len() as u16).to_be_bytes());
+        res.push(0);
+        let byte_count = byte_count as u32;
+        res.extend_from_slice(&byte_count.to_be_bytes()[1..]);
+
+        res.push(element_type);
+        res.push(0x80);
+        res.extend_from_slice(&desc_len.to_be_bytes());
+        res.push(0);
+        let descriptor_byte_count = descriptor_byte_count as u32;
+        res.extend_from_slice(&descriptor_byte_count.to_be_bytes()[1..]);
+
+        for desc in descs {
+            res.extend_from_slice(&desc);
+        }
+
+        res.extend_from_slice(trailing);
+
+        res
+    }
+
+    fn build_storage_descriptor(
+        desc: &StorageDesc,
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut res = Vec::new();
+        res.push(((desc.address >> 8) & 0xFF) as u8);
+        res.push((desc.address & 0xFF) as u8);
+        if desc.pvoltag.is_some() {
+            res.push(0x01); // full
+        } else {
+            res.push(0x00); // full
+        }
+
+        res.extend_from_slice(&[0,0,0,0,0,0,0x80]);
+        res.push(((desc.address >> 8) & 0xFF) as u8);
+        res.push((desc.address & 0xFF) as u8);
+
+        if let Some(voltag) = &desc.pvoltag {
+            res.extend_from_slice(voltag.as_bytes());
+            let rem = SCSI_VOLUME_TAG_LEN - voltag.as_bytes().len();
+            if rem > 0 {
+                res.resize(res.len() + rem, 0);
+            }
+        }
+
+        res.extend_from_slice(trailing);
+
+        res
+    }
+
+    #[test]
+    fn status_page_valid() -> Result<(), Error> {
+        let descs = vec![
+            StorageDesc {
+                address: 0,
+                pvoltag: Some("0123456789".to_string()),
+            },
+            StorageDesc {
+                address: 1,
+                pvoltag: Some("1234567890".to_string()),
+            },
+        ];
+        let test_data = build_element_status_page(descs, &[], 0x2);
+        let page = decode_element_status_page(&test_data, 0)?;
+        assert_eq!(page.storage_slots.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn status_page_too_short() -> Result<(), Error> {
+        let descs = vec![
+            StorageDesc {
+                address: 0,
+                pvoltag: Some("0123456789".to_string()),
+            },
+            StorageDesc {
+                address: 1,
+                pvoltag: Some("1234567890".to_string()),
+            },
+        ];
+        let test_data = build_element_status_page(descs, &[], 0x2);
+        let len = test_data.len();
+        let res = decode_element_status_page(&test_data[..(len - 10)], 0);
+        assert!(res.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn status_page_too_large() -> Result<(), Error> {
+        let descs = vec![
+            StorageDesc {
+                address: 0,
+                pvoltag: Some("0123456789".to_string()),
+            },
+            StorageDesc {
+                address: 1,
+                pvoltag: Some("1234567890".to_string()),
+            },
+        ];
+        let test_data = build_element_status_page(descs, &[0,0,0,0,0], 0x2);
+        let page = decode_element_status_page(&test_data, 0)?;
+        assert_eq!(page.storage_slots.len(), 2);
+        Ok(())
+    }
 }

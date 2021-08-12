@@ -2,34 +2,62 @@
 
 use anyhow::{Error};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use proxmox::api::{api, Permission};
-use proxmox::api::router::Router;
+use proxmox::api::{api, Permission, Router, RpcEnvironment};
 
+use crate::config;
 use crate::api2::types::*;
+
+#[api]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+/// type of the realm
+pub enum RealmType {
+    /// The PAM realm
+    Pam,
+    /// The PBS realm
+    Pbs,
+    /// An OpenID Connect realm
+    OpenId,
+}
+
+#[api(
+    properties: {
+        realm: {
+            schema: REALM_ID_SCHEMA,
+        },
+        "type": {
+            type: RealmType,
+        },
+        comment: {
+            optional: true,
+            schema: SINGLE_LINE_COMMENT_SCHEMA,
+        },
+    },
+)]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+/// Basic Information about a realm
+pub struct BasicRealmInfo {
+    pub realm: String,
+    #[serde(rename = "type")]
+    pub ty: RealmType,
+    /// True if it is the default realm
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
 
 #[api(
     returns: {
-        description: "List of realms.",
+        description: "List of realms with basic info.",
         type: Array,
         items: {
-            type: Object,
-            description: "User configuration (without password).",
-            properties: {
-                realm: {
-                    description: "Realm ID.",
-                    type: String,
-                },
-                comment: {
-                    schema: SINGLE_LINE_COMMENT_SCHEMA,
-                    optional: true,
-                },
-                default: {
-                    description: "Default realm.",
-                    type: bool,
-                }
-            },
+            type: BasicRealmInfo,
         }
     },
     access: {
@@ -38,11 +66,32 @@ use crate::api2::types::*;
     }
 )]
 /// Authentication domain/realm index.
-fn list_domains() -> Result<Value, Error> {
+fn list_domains(mut rpcenv: &mut dyn RpcEnvironment) -> Result<Vec<BasicRealmInfo>, Error> {
     let mut list = Vec::new();
-    list.push(json!({ "realm": "pam", "comment": "Linux PAM standard authentication", "default": true }));
-    list.push(json!({ "realm": "pbs", "comment": "Proxmox Backup authentication server" }));
-    Ok(list.into())
+
+    list.push(serde_json::from_value(json!({
+        "realm": "pam",
+        "type": "pam",
+        "comment": "Linux PAM standard authentication",
+        "default": Some(true),
+    }))?);
+    list.push(serde_json::from_value(json!({
+        "realm": "pbs",
+        "type": "pbs",
+        "comment": "Proxmox Backup authentication server",
+    }))?);
+
+    let (config, digest) = config::domains::config()?;
+
+    for (_, (section_type, v)) in config.sections.iter() {
+        let mut entry = v.clone();
+        entry["type"] = Value::from(section_type.clone());
+        list.push(serde_json::from_value(entry)?);
+    }
+
+    rpcenv["digest"] = proxmox::tools::digest_to_hex(&digest).into();
+
+    Ok(list)
 }
 
 pub const ROUTER: Router = Router::new()

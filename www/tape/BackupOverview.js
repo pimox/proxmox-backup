@@ -13,40 +13,31 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 			me.reload();
 		    },
 		},
-	    }).show();
+		autoShow: true,
+	    });
 	},
 
-	restore: function(button, record) {
-	    let me = this;
-	    let view = me.getView();
-	    let selection = view.getSelection();
-	    if (!selection || selection.length < 1) {
-		return;
-	    }
-
-	    let node = selection[0];
-	    let mediaset = node.data.text;
-	    let uuid = node.data['media-set-uuid'];
-	    let datastores = node.data.datastores;
-	    while (!datastores && node.get('depth') > 2) {
-		node = node.parentNode;
-		datastores = node.data.datastores;
-	    }
+	restore: function() {
 	    Ext.create('PBS.TapeManagement.TapeRestoreWindow', {
+		autoShow: true,
+	    });
+	},
+
+	restoreBackups: function(view, rI, cI, item, e, rec) {
+	    let me = this;
+
+	    let mediaset = rec.data.is_media_set ? rec.data.text : rec.data['media-set'];
+	    Ext.create('PBS.TapeManagement.TapeRestoreWindow', {
+		autoShow: true,
+		uuid: rec.data['media-set-uuid'],
+		prefilter: rec.data.prefilter,
 		mediaset,
-		uuid,
-		datastores,
-		listeners: {
-		    destroy: function() {
-			me.reload();
-		    },
-		},
-	    }).show();
+	    });
 	},
 
 	loadContent: async function() {
 	    let me = this;
-	    let content_response = await PBS.Async.api2({
+	    let content_response = await Proxmox.Async.api2({
 		url: '/api2/extjs/tape/media/list?update-status=false',
 	    });
 	    let data = {};
@@ -67,9 +58,11 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 		if (data[pool][media_set] === undefined) {
 		    data[pool][media_set] = entry;
 		    data[pool][media_set].text = media_set;
+		    data[pool][media_set].restore = true;
 		    data[pool][media_set].tapes = 1;
 		    data[pool][media_set]['seq-nr'] = undefined;
 		    data[pool][media_set].is_media_set = true;
+		    data[pool][media_set].typeText = 'media-set';
 		} else {
 		    data[pool][media_set].tapes++;
 		}
@@ -80,6 +73,8 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 	    for (const [pool, media_sets] of Object.entries(data)) {
 		let pool_entry = Ext.create('Ext.data.TreeModel', {
 		    text: pool,
+		    iconCls: 'fa fa-object-group',
+		    expanded: true,
 		    leaf: false,
 		});
 
@@ -123,14 +118,18 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 	    let view = me.getView();
 
 	    Proxmox.Utils.setErrorMask(view, true);
-	    const media_set = node.data['media-set-uuid'];
+	    const media_set_uuid = node.data['media-set-uuid'];
+	    const media_set = node.data.text;
 
 	    try {
-		let list = await PBS.Async.api2({
+		let list = await Proxmox.Async.api2({
 		    method: 'GET',
 		    url: `/api2/extjs/tape/media/content`,
+		    // a big media-set with large catalogs can take a while to load
+		    // so we give a big (5min) timeout
+		    timeout: 5*60*1000,
 		    params: {
-			'media-set': media_set,
+			'media-set': media_set_uuid,
 		    },
 		});
 
@@ -147,8 +146,14 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 
 		for (let entry of list.result.data) {
 		    entry.text = entry.snapshot;
+		    entry.restore = true;
 		    entry.leaf = true;
 		    entry.children = [];
+		    entry['media-set'] = media_set;
+		    entry.prefilter = {
+			store: entry.store,
+			snapshot: entry.snapshot,
+		    };
 		    let iconCls = PBS.Utils.get_type_icon_cls(entry.snapshot);
 		    if (iconCls !== '') {
 			entry.iconCls = `fa ${iconCls}`;
@@ -161,6 +166,12 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 			    text: store,
 			    'media-set-uuid': entry['media-set-uuid'],
 			    iconCls: 'fa fa-database',
+			    typeText: 'datastore',
+			    restore: true,
+			    'media-set': media_set,
+			    prefilter: {
+				store,
+			    },
 			    tapes: {},
 			};
 		    }
@@ -184,7 +195,14 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 			    text,
 			    'media-set-uuid': entry['media-set-uuid'],
 			    leaf: false,
+			    restore: true,
+			    prefilter: {
+				store,
+				snapshot: `${type}/${group}/`,
+			    },
+			    'media-set': media_set,
 			    iconCls: `fa ${iconCls}`,
+			    typeText: `group`,
 			    children: [],
 			});
 		    }
@@ -209,9 +227,9 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 		node.set('datastores', storeNameList);
 		Proxmox.Utils.setErrorMask(view, false);
 		node.expand();
-	    } catch (error) {
+	    } catch (response) {
 		Proxmox.Utils.setErrorMask(view, false);
-		Ext.Msg.alert('Error', error.toString());
+		Ext.Msg.alert('Error', response.result.message.toString());
 	    }
 	},
 
@@ -247,30 +265,49 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
     tbar: [
 	{
 	    text: gettext('Reload'),
+	    iconCls: 'fa fa-refresh',
 	    handler: 'reload',
 	},
 	'-',
 	{
 	    text: gettext('New Backup'),
+	    iconCls: 'fa fa-floppy-o',
 	    handler: 'backup',
 	},
+	'-',
 	{
-	    xtype: 'proxmoxButton',
-	    disabled: true,
-	    text: gettext('Restore Media Set'),
+	    text: gettext('Restore'),
+	    iconCls: 'fa fa-undo',
 	    handler: 'restore',
-	    parentXType: 'treepanel',
-	    enableFn: (rec) => !!rec.data['media-set-uuid'],
 	},
     ],
 
     columns: [
 	{
 	    xtype: 'treecolumn',
-	    text: gettext('Pool/Media Set/Snapshot'),
+	    text: gettext('Pool/Media-Set/Snapshot'),
 	    dataIndex: 'text',
 	    sortable: false,
 	    flex: 3,
+	},
+	{
+	    header: gettext('Restore'),
+	    xtype: 'actioncolumn',
+	    dataIndex: 'text',
+	    items: [
+		{
+		    handler: 'restoreBackups',
+		    getTip: (v, m, rec) => {
+			let typeText = rec.get('typeText');
+			if (typeText) {
+			    v = `${typeText} '${v}'`;
+			}
+			return Ext.String.format(gettext("Open restore wizard for {0}"), v);
+		    },
+		    getClass: (v, m, rec) => rec.data.restore ? 'fa fa-fw fa-undo' : 'pmx-hidden',
+		    isActionDisabled: (v, r, c, i, rec) => !rec.data.restore,
+                },
+	    ],
 	},
 	{
 	    text: gettext('Tapes'),
@@ -283,7 +320,7 @@ Ext.define('PBS.TapeManagement.BackupOverview', {
 	    sortable: false,
 	},
 	{
-	    text: gettext('Media Set UUID'),
+	    text: gettext('Media-Set UUID'),
 	    dataIndex: 'media-set-uuid',
 	    hidden: true,
 	    sortable: false,

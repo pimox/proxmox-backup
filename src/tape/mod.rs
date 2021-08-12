@@ -7,6 +7,8 @@ use proxmox::tools::fs::{
     CreateOptions,
 };
 
+use pbs_buildcfg::PROXMOX_BACKUP_RUN_DIR_M;
+
 #[cfg(test)]
 mod test;
 
@@ -40,11 +42,17 @@ pub use media_pool::*;
 mod media_catalog;
 pub use media_catalog::*;
 
+mod media_catalog_cache;
+pub use media_catalog_cache::*;
+
 mod pool_writer;
 pub use pool_writer::*;
 
 /// Directory path where we store all tape status information
 pub const TAPE_STATUS_DIR: &str = "/var/lib/proxmox-backup/tape";
+
+/// Directory path where we store drive lock file
+pub const DRIVE_LOCK_DIR: &str = concat!(PROXMOX_BACKUP_RUN_DIR_M!(), "/drive-lock");
 
 /// Directory path where we store temporary drive state
 pub const DRIVE_STATE_DIR: &str = concat!(PROXMOX_BACKUP_RUN_DIR_M!(), "/drive-state");
@@ -72,6 +80,21 @@ pub fn create_tape_status_dir() -> Result<(), Error> {
 
     create_path(TAPE_STATUS_DIR, None, Some(options))
         .map_err(|err: Error| format_err!("unable to create tape status dir - {}", err))?;
+
+    Ok(())
+}
+
+/// Create drive lock dir with correct permission
+pub fn create_drive_lock_dir() -> Result<(), Error> {
+    let backup_user = crate::backup::backup_user()?;
+    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
+    let options = CreateOptions::new()
+        .perm(mode)
+        .owner(backup_user.uid)
+        .group(backup_user.gid);
+
+    create_path(DRIVE_LOCK_DIR, None, Some(options))
+        .map_err(|err: Error| format_err!("unable to create drive state dir - {}", err))?;
 
     Ok(())
 }

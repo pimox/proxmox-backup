@@ -49,8 +49,9 @@ impl VirtualTapeDrive {
             let mut lock_path = std::path::PathBuf::from(&self.path);
             lock_path.push(".drive.lck");
 
+            let options = CreateOptions::new();
             let timeout = std::time::Duration::new(10, 0);
-            let lock = proxmox::tools::fs::open_file_locked(&lock_path, timeout, true)?;
+            let lock = proxmox::tools::fs::open_file_locked(&lock_path, timeout, true, options)?;
 
             Ok(VirtualTapeHandle {
                 _lock: lock,
@@ -261,6 +262,28 @@ impl TapeDriver for VirtualTapeHandle {
         Ok(())
     }
 
+    fn move_to_file(&mut self, file: u64) -> Result<(), Error> {
+        let mut status = self.load_status()?;
+        match status.current_tape {
+            Some(VirtualTapeStatus { ref name, ref mut pos }) => {
+
+                let index = self.load_tape_index(name)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+                if file as usize > index.files {
+                    bail!("invalid file nr");
+                }
+
+                *pos = file as usize;
+
+                self.store_status(&status)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+                Ok(())
+            }
+            None => bail!("drive is empty (no tape loaded)."),
+        }
+    }
 
     fn read_next_file(&mut self) -> Result<Box<dyn TapeRead>, BlockReadError> {
         let mut status = self.load_status()

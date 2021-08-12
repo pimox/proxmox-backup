@@ -1,7 +1,7 @@
 //! Helper to start a QEMU VM for single file restore.
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,14 +11,12 @@ use tokio::time;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
-use proxmox::tools::{
-    fd::Fd,
-    fs::{create_path, file_read_string, make_tmp_file, CreateOptions},
-};
+use proxmox::tools::fs::{create_path, file_read_string, make_tmp_file, CreateOptions};
+
+use pbs_client::{VsockClient, DEFAULT_VSOCK_PORT};
 
 use proxmox_backup::backup::backup_user;
-use proxmox_backup::client::{VsockClient, DEFAULT_VSOCK_PORT};
-use proxmox_backup::{buildcfg, tools};
+use proxmox_backup::tools;
 
 use super::SnapRestoreDetails;
 
@@ -26,7 +24,7 @@ const PBS_VM_NAME: &str = "pbs-restore-vm";
 const MAX_CID_TRIES: u64 = 32;
 
 fn create_restore_log_dir() -> Result<String, Error> {
-    let logpath = format!("{}/file-restore", buildcfg::PROXMOX_BACKUP_LOG_DIR);
+    let logpath = format!("{}/file-restore", pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR);
 
     proxmox::try_block!({
         let backup_user = backup_user()?;
@@ -38,7 +36,7 @@ fn create_restore_log_dir() -> Result<String, Error> {
             .owner(nix::unistd::ROOT)
             .group(nix::unistd::Gid::from_raw(0));
 
-        create_path(buildcfg::PROXMOX_BACKUP_LOG_DIR, None, Some(opts))?;
+        create_path(pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR, None, Some(opts))?;
         create_path(&logpath, None, Some(opts_root))?;
         Ok(())
     })
@@ -47,16 +45,20 @@ fn create_restore_log_dir() -> Result<String, Error> {
     Ok(logpath)
 }
 
-fn validate_img_existance() -> Result<(), Error> {
-    let kernel = PathBuf::from(buildcfg::PROXMOX_BACKUP_KERNEL_FN);
-    let initramfs = PathBuf::from(buildcfg::PROXMOX_BACKUP_INITRAMFS_FN);
+fn validate_img_existance(debug: bool) -> Result<(), Error> {
+    let kernel = PathBuf::from(pbs_buildcfg::PROXMOX_BACKUP_KERNEL_FN);
+    let initramfs = PathBuf::from(if debug {
+        pbs_buildcfg::PROXMOX_BACKUP_INITRAMFS_DBG_FN
+    } else {
+        pbs_buildcfg::PROXMOX_BACKUP_INITRAMFS_FN
+    });
     if !kernel.exists() || !initramfs.exists() {
         bail!("cannot run file-restore VM: package 'proxmox-backup-restore-image' is not (correctly) installed");
     }
     Ok(())
 }
 
-fn try_kill_vm(pid: i32) -> Result<(), Error> {
+pub fn try_kill_vm(pid: i32) -> Result<(), Error> {
     let pid = Pid::from_raw(pid);
     if let Ok(()) = kill(pid, None) {
         // process is running (and we could kill it), check if it is actually ours
@@ -79,17 +81,23 @@ fn try_kill_vm(pid: i32) -> Result<(), Error> {
     Ok(())
 }
 
-async fn create_temp_initramfs(ticket: &str) -> Result<(Fd, String), Error> {
+async fn create_temp_initramfs(ticket: &str, debug: bool) -> Result<(File, String), Error> {
     use std::ffi::CString;
     use tokio::fs::File;
 
-    let (tmp_fd, tmp_path) =
+    let (tmp_file, tmp_path) =
         make_tmp_file("/tmp/file-restore-qemu.initramfs.tmp", CreateOptions::new())?;
     nix::unistd::unlink(&tmp_path)?;
-    tools::fd_change_cloexec(tmp_fd.0, false)?;
+    tools::fd_change_cloexec(tmp_file.as_raw_fd(), false)?;
 
-    let mut f = File::from_std(unsafe { std::fs::File::from_raw_fd(tmp_fd.0) });
-    let mut base = File::open(buildcfg::PROXMOX_BACKUP_INITRAMFS_FN).await?;
+    let initramfs = if debug {
+        pbs_buildcfg::PROXMOX_BACKUP_INITRAMFS_DBG_FN
+    } else {
+        pbs_buildcfg::PROXMOX_BACKUP_INITRAMFS_FN
+    };
+
+    let mut f = File::from_std(tmp_file);
+    let mut base = File::open(initramfs).await?;
 
     tokio::io::copy(&mut base, &mut f).await?;
 
@@ -108,11 +116,10 @@ async fn create_temp_initramfs(ticket: &str) -> Result<(Fd, String), Error> {
     .await?;
     tools::cpio::append_trailer(&mut f).await?;
 
-    // forget the tokio file, we close the file descriptor via the returned Fd
-    std::mem::forget(f);
+    let tmp_file = f.into_std().await;
+    let path = format!("/dev/fd/{}", &tmp_file.as_raw_fd());
 
-    let path = format!("/dev/fd/{}", &tmp_fd.0);
-    Ok((tmp_fd, path))
+    Ok((tmp_file, path))
 }
 
 pub async fn start_vm(
@@ -122,18 +129,24 @@ pub async fn start_vm(
     files: impl Iterator<Item = String>,
     ticket: &str,
 ) -> Result<(i32, i32), Error> {
-    validate_img_existance()?;
-
     if let Err(_) = std::env::var("PBS_PASSWORD") {
         bail!("environment variable PBS_PASSWORD has to be set for QEMU VM restore");
     }
 
-    let pid;
-    let (pid_fd, pid_path) = make_tmp_file("/tmp/file-restore-qemu.pid.tmp", CreateOptions::new())?;
-    nix::unistd::unlink(&pid_path)?;
-    tools::fd_change_cloexec(pid_fd.0, false)?;
+    let debug = if let Ok(val) = std::env::var("PBS_QEMU_DEBUG") {
+        !val.is_empty()
+    } else {
+        false
+    };
 
-    let (_ramfs_pid, ramfs_path) = create_temp_initramfs(ticket).await?;
+    validate_img_existance(debug)?;
+
+    let pid;
+    let (mut pid_file, pid_path) = make_tmp_file("/tmp/file-restore-qemu.pid.tmp", CreateOptions::new())?;
+    nix::unistd::unlink(&pid_path)?;
+    tools::fd_change_cloexec(pid_file.as_raw_fd(), false)?;
+
+    let (_ramfs_pid, ramfs_path) = create_temp_initramfs(ticket, debug).await?;
 
     let logpath = create_restore_log_dir()?;
     let logfile = &format!("{}/qemu.log", logpath);
@@ -167,17 +180,18 @@ pub async fn start_vm(
         "-vnc",
         "none",
         "-enable-kvm",
-        "-m",
-        "128",
         "-kernel",
-        buildcfg::PROXMOX_BACKUP_KERNEL_FN,
+        pbs_buildcfg::PROXMOX_BACKUP_KERNEL_FN,
         "-initrd",
         &ramfs_path,
         "-append",
-        "quiet panic=1",
+        &format!(
+            "{} panic=1 zfs_arc_min=0 zfs_arc_max=0",
+            if debug { "debug" } else { "quiet" }
+        ),
         "-daemonize",
         "-pidfile",
-        &format!("/dev/fd/{}", pid_fd.as_raw_fd()),
+        &format!("/dev/fd/{}", pid_file.as_raw_fd()),
         "-name",
         PBS_VM_NAME,
     ];
@@ -199,24 +213,61 @@ pub async fn start_vm(
             "file=pbs:repository={},,snapshot={},,archive={}{},read-only=on,if=none,id=drive{}",
             details.repo, details.snapshot, file, keyfile, id
         ));
+
+        // a PCI bus can only support 32 devices, so add a new one every 32
+        let bus = (id / 32) + 2;
+        if id % 32 == 0 {
+            drives.push("-device".to_owned());
+            drives.push(format!("pci-bridge,id=bridge{},chassis_nr={}", bus, bus));
+        }
+
         drives.push("-device".to_owned());
         // drive serial is used by VM to map .fidx files to /dev paths
         let serial = file.strip_suffix(".img.fidx").unwrap_or(&file);
-        drives.push(format!("virtio-blk-pci,drive=drive{},serial={}", id, serial));
+        drives.push(format!(
+            "virtio-blk-pci,drive=drive{},serial={},bus=bridge{}",
+            id, serial, bus
+        ));
         id += 1;
     }
+
+    let ram = if debug {
+        1024
+    } else {
+        // add more RAM if many drives are given
+        match id {
+            f if f < 10 => 192,
+            f if f < 20 => 256,
+            _ => 384,
+        }
+    };
 
     // Try starting QEMU in a loop to retry if we fail because of a bad 'cid' value
     let mut attempts = 0;
     loop {
         let mut qemu_cmd = std::process::Command::new("qemu-system-x86_64");
         qemu_cmd.args(base_args.iter());
+        qemu_cmd.arg("-m");
+        qemu_cmd.arg(ram.to_string());
         qemu_cmd.args(&drives);
         qemu_cmd.arg("-device");
         qemu_cmd.arg(format!(
             "vhost-vsock-pci,guest-cid={},disable-legacy=on",
             cid
         ));
+
+        if debug {
+            let debug_args = [
+                "-chardev",
+                &format!(
+                    "socket,id=debugser,path=/run/proxmox-backup/file-restore-serial-{}.sock,server,nowait",
+                    cid
+                ),
+                "-serial",
+                "chardev:debugser",
+            ];
+            qemu_cmd.args(debug_args.iter());
+        }
 
         qemu_cmd.stdout(std::process::Stdio::null());
         qemu_cmd.stderr(std::process::Stdio::piped());
@@ -227,8 +278,6 @@ pub async fn start_vm(
             // at this point QEMU is already daemonized and running, so if anything fails we
             // technically leave behind a zombie-VM... this shouldn't matter, as it will stop
             // itself soon enough (timer), and the following operations are unlikely to fail
-            let mut pid_file = unsafe { File::from_raw_fd(pid_fd.as_raw_fd()) };
-            std::mem::forget(pid_fd); // FD ownership is now in pid_fd/File
             let mut pidstr = String::new();
             pid_file.read_to_string(&mut pidstr)?;
             pid = pidstr.trim_end().parse().map_err(|err| {
@@ -260,10 +309,15 @@ pub async fn start_vm(
         if let Ok(Ok(_)) =
             time::timeout(Duration::from_secs(2), client.get("api2/json/status", None)).await
         {
+            if debug {
+                eprintln!(
+                    "Connect to '/run/proxmox-backup/file-restore-serial-{}.sock' for shell access",
+                    cid
+                )
+            }
             return Ok((pid, cid as i32));
         }
-        if kill(pid_t, None).is_err() {
-            // QEMU exited
+        if kill(pid_t, None).is_err() { // check if QEMU process exited in between
             bail!("VM exited before connection could be established");
         }
         time::sleep(Duration::from_millis(200)).await;

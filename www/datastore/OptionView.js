@@ -21,6 +21,26 @@ Ext.define('PBS.Datastore.Options', {
 	edit: function() {
 	    this.getView().run_editor();
 	},
+
+	removeDatastore: function() {
+	    let me = this;
+	    let datastore = me.getView().datastore;
+	    Ext.create('Proxmox.window.SafeDestroy', {
+		url: `/config/datastore/${datastore}`,
+		item: {
+		    id: datastore,
+		},
+		note: gettext('Configuration change only, no data will be deleted.'),
+		autoShow: true,
+		taskName: 'delete-datastore',
+		apiCallDone: (success) => {
+		    let navtree = Ext.ComponentQuery.query('navigationtree')[0];
+		    navtree.rstore.load();
+		    let mainview = me.getView().up('mainview');
+		    mainview.getController().redirectTo('pbsDataStores');
+		},
+	    });
+	},
     },
 
     tbar: [
@@ -29,6 +49,14 @@ Ext.define('PBS.Datastore.Options', {
 	    text: gettext('Edit'),
 	    disabled: true,
 	    handler: 'edit',
+	},
+	'->',
+	{
+	    xtype: 'proxmoxButton',
+	    selModel: null,
+	    iconCls: 'fa fa-trash-o',
+	    text: gettext('Remove Datastore'),
+	    handler: 'removeDatastore',
 	},
     ],
 

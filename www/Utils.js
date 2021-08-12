@@ -368,13 +368,24 @@ Ext.define('PBS.Utils', {
 
 	// do whatever you want here
 	Proxmox.Utils.override_task_descriptions({
+	    'acme-deactivate': (type, id) =>
+		Ext.String.format(gettext("Deactivate {0} Account"), 'ACME') + ` '${id || 'default'}'`,
+	    'acme-register': (type, id) =>
+		Ext.String.format(gettext("Register {0} Account"), 'ACME') + ` '${id || 'default'}'`,
+	    'acme-update': (type, id) =>
+		Ext.String.format(gettext("Update {0} Account"), 'ACME') + ` '${id || 'default'}'`,
+	    'acme-new-cert': ['', gettext('Order Certificate')],
+	    'acme-renew-cert': ['', gettext('Renew Certificate')],
+	    'acme-revoke-cert': ['', gettext('Revoke Certificate')],
 	    backup: (type, id) => PBS.Utils.render_datastore_worker_id(id, gettext('Backup')),
 	    'barcode-label-media': [gettext('Drive'), gettext('Barcode-Label Media')],
 	    'catalog-media': [gettext('Drive'), gettext('Catalog Media')],
+	    'delete-datastore': [gettext('Datastore'), gettext('Remove Datastore')],
 	    dircreate: [gettext('Directory Storage'), gettext('Create')],
 	    dirremove: [gettext('Directory'), gettext('Remove')],
 	    'eject-media': [gettext('Drive'), gettext('Eject Media')],
 	    "format-media": [gettext('Drive'), gettext('Format media')],
+	    "forget-group": [gettext('Group'), gettext('Remove Group')],
 	    garbage_collection: ['Datastore', gettext('Garbage Collect')],
 	    'inventory-update': [gettext('Drive'), gettext('Inventory Update')],
 	    'label-media': [gettext('Drive'), gettext('Label Media')],
@@ -394,6 +405,15 @@ Ext.define('PBS.Utils', {
 	    verify_group: ['Group', gettext('Verification')],
 	    verify_snapshot: ['Snapshot', gettext('Verification')],
 	    zfscreate: [gettext('ZFS Storage'), gettext('Create')],
+	});
+
+	Proxmox.Schema.overrideAuthDomains({
+	    pbs: {
+		name: 'Proxmox Backup authentication server',
+		add: false,
+		edit: false,
+		pwchange: true,
+	    },
 	});
     },
 
@@ -620,29 +640,4 @@ Ext.define('PBS.Utils', {
 	return `${icon} ${value}`;
     },
 
-});
-
-Ext.define('PBS.Async', {
-    singleton: true,
-
-    // Returns a Promise resolving to the result of an `API2Request`.
-    api2: function(reqOpts) {
-	return new Promise((resolve, reject) => {
-	    delete reqOpts.callback; // not allowed in this api
-	    reqOpts.success = response => resolve(response);
-	    reqOpts.failure = response => {
-		if (response.result && response.result.message) {
-		    reject(response.result.message);
-		} else {
-		    reject("api call failed");
-		}
-	    };
-	    Proxmox.Utils.API2Request(reqOpts);
-	});
-    },
-
-    // Delay for a number of milliseconds.
-    sleep: function(millis) {
-	return new Promise((resolve, _reject) => setTimeout(resolve, millis));
-    },
 });

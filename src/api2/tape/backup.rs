@@ -15,9 +15,10 @@ use proxmox::{
     },
 };
 
+use pbs_datastore::{task_log, task_warn};
+use pbs_datastore::task::TaskState;
+
 use crate::{
-    task_log,
-    task_warn,
     config::{
         self,
         cached_user_info::CachedUserInfo,
@@ -55,7 +56,6 @@ use crate::{
         Userid,
     },
     server::WorkerTask,
-    task::TaskState,
     tape::{
         TAPE_STATUS_DIR,
         Inventory,
@@ -65,6 +65,7 @@ use crate::{
         drive::{
             media_changer,
             lock_tape_device,
+            TapeLockError,
             set_tape_device_state,
         },
         changer::update_changer_online_status,
@@ -125,9 +126,11 @@ pub fn list_tape_backup_jobs(
     let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
     let user_info = CachedUserInfo::new()?;
 
-    let (config, digest) = config::tape_job::config()?;
+    let (job_config, digest) = config::tape_job::config()?;
+    let (pool_config, _pool_digest) = config::media_pool::config()?;
+    let (drive_config, _digest) = config::drive::config()?;
 
-    let job_list_iter = config
+    let job_list_iter = job_config
         .convert_to_typed_array("backup")?
         .into_iter()
         .filter(|_job: &TapeBackupJobConfig| {
@@ -136,6 +139,8 @@ pub fn list_tape_backup_jobs(
         });
 
     let mut list = Vec::new();
+    let status_path = Path::new(TAPE_STATUS_DIR);
+    let current_time = proxmox::tools::time::epoch_i64();
 
     for job in job_list_iter {
         let privs = user_info.lookup_privs(&auth_id, &["tape", "job", &job.id]);
@@ -148,7 +153,25 @@ pub fn list_tape_backup_jobs(
 
         let status = compute_schedule_status(&last_state, job.schedule.as_deref())?;
 
-        list.push(TapeBackupJobStatus { config: job, status });
+        let next_run = status.next_run.unwrap_or(current_time);
+
+        let mut next_media_label = None;
+
+        if let Ok(pool) = pool_config.lookup::<MediaPoolConfig>("pool", &job.setup.pool) {
+            let mut changer_name = None;
+            if let Ok(Some((_, name))) = media_changer(&drive_config, &job.setup.drive) {
+                changer_name = Some(name);
+            }
+            if let Ok(mut pool) = MediaPool::with_config(status_path, &pool, changer_name, true) {
+                if pool.start_write_session(next_run, false).is_ok() {
+                    if let Ok(media_id) = pool.guess_next_writable_media(next_run) {
+                        next_media_label = Some(media_id.label.label_text);
+                    }
+                }
+            }
+        }
+
+        list.push(TapeBackupJobStatus { config: job, status, next_media_label });
     }
 
     rpcenv["digest"] = proxmox::tools::digest_to_hex(&digest).into();
@@ -203,12 +226,15 @@ pub fn do_tape_backup_job(
                     // for scheduled tape backup jobs, we wait indefinitely for the lock
                     task_log!(worker, "waiting for drive lock...");
                     loop {
-                        if let Ok(lock) = lock_tape_device(&drive_config, &setup.drive) {
-                            drive_lock = Some(lock);
-                            break;
-                        } // ignore errors
-
                         worker.check_abort()?;
+                        match lock_tape_device(&drive_config, &setup.drive) {
+                            Ok(lock) => {
+                                drive_lock = Some(lock);
+                                break;
+                            }
+                            Err(TapeLockError::TimeOut) => continue,
+                            Err(TapeLockError::Other(err)) => return Err(err),
+                        }
                     }
                 }
                 set_tape_device_state(&setup.drive, &worker.upid().to_string())?;
@@ -226,6 +252,7 @@ pub fn do_tape_backup_job(
                     &setup,
                     email.clone(),
                     &mut summary,
+                    false,
                 )
             });
 
@@ -312,6 +339,12 @@ pub fn run_tape_backup_job(
                 type: TapeBackupJobSetup,
                 flatten: true,
             },
+            "force-media-set": {
+                description: "Ignore the allocation policy and start a new media-set.",
+                optional: true,
+                type: bool,
+                default: false,
+            },
         },
     },
     returns: {
@@ -327,6 +360,7 @@ pub fn run_tape_backup_job(
 /// Backup datastore to tape media pool
 pub fn backup(
     setup: TapeBackupJobSetup,
+    force_media_set: bool,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<Value, Error> {
 
@@ -373,6 +407,7 @@ pub fn backup(
                 &setup,
                 email.clone(),
                 &mut summary,
+                force_media_set,
             );
 
             if let Some(email) = email {
@@ -403,6 +438,7 @@ fn backup_worker(
     setup: &TapeBackupJobSetup,
     email: Option<String>,
     summary: &mut TapeBackupJobSummary,
+    force_media_set: bool,
 ) -> Result<(), Error> {
 
     let status_path = Path::new(TAPE_STATUS_DIR);
@@ -413,7 +449,13 @@ fn backup_worker(
 
     let pool = MediaPool::with_config(status_path, &pool_config, changer_name, false)?;
 
-    let mut pool_writer = PoolWriter::new(pool, &setup.drive, worker, email)?;
+    let mut pool_writer = PoolWriter::new(
+        pool,
+        &setup.drive,
+        worker,
+        email,
+        force_media_set
+    )?;
 
     let mut group_list = BackupInfo::list_backup_groups(&datastore.base_path())?;
 
@@ -444,10 +486,15 @@ fn backup_worker(
         let snapshot_list = group.list_backups(&datastore.base_path())?;
 
         // filter out unfinished backups
-        let mut snapshot_list = snapshot_list
+        let mut snapshot_list: Vec<_> = snapshot_list
             .into_iter()
             .filter(|item| item.is_finished())
             .collect();
+
+        if snapshot_list.is_empty() {
+            task_log!(worker, "group {} was empty", group);
+            continue;
+        }
 
         BackupInfo::sort_list(&mut snapshot_list, true); // oldest first
 

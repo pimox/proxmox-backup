@@ -1,21 +1,23 @@
 //! Block file access via a small QEMU restore VM using the PBS block driver in QEMU
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{prelude::*, SeekFrom};
+
 use anyhow::{bail, Error};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{prelude::*, SeekFrom};
-
 use proxmox::tools::fs::lock_file;
+
+use pbs_client::{DEFAULT_VSOCK_PORT, BackupRepository, VsockClient};
+
 use proxmox_backup::api2::types::ArchiveEntry;
 use proxmox_backup::backup::BackupDir;
-use proxmox_backup::client::*;
 use proxmox_backup::tools;
 
 use super::block_driver::*;
-use crate::proxmox_client_tools::get_user_run_dir;
+use crate::get_user_run_dir;
 
 const RESTORE_VM_MAP: &str = "restore-vm-map.json";
 
@@ -50,7 +52,7 @@ impl VMStateMap {
     /// Acquire a lock on the state map and retrieve a deserialized version
     fn load() -> Result<Self, Error> {
         let mut file = Self::open_file_raw(true)?;
-        lock_file(&mut file, true, Some(std::time::Duration::from_secs(5)))?;
+        lock_file(&mut file, true, Some(std::time::Duration::from_secs(120)))?;
         let map = serde_json::from_reader(&file).unwrap_or_default();
         Ok(Self { map, file })
     }
@@ -98,6 +100,7 @@ async fn cleanup_map(map: &mut HashMap<String, VMState>) -> bool {
                 "VM '{}' (pid: {}, cid: {}) was not reachable, removing from map",
                 name, state.pid, state.cid
             );
+            let _ = super::qemu_helper::try_kill_vm(state.pid);
         }
     }
 
@@ -131,6 +134,7 @@ async fn ensure_running(details: &SnapRestoreDetails) -> Result<VsockClient, Err
                 Err(err) => {
                     eprintln!("stale VM detected, restarting ({})", err);
                     // VM is dead, restart
+                    let _ = super::qemu_helper::try_kill_vm(vm.pid);
                     let vms = start_vm(vm.cid, details).await?;
                     new_cid = vms.cid;
                     state.map.insert(name, vms.clone());

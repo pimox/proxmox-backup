@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 
 use anyhow::{bail, format_err, Error};
 use futures::*;
@@ -15,13 +16,20 @@ use proxmox::api::{
     api, ApiResponseFuture, ApiHandler, ApiMethod, Router,
     RpcEnvironment, RpcEnvironmentType, Permission
 };
-use proxmox::api::router::{ReturnType, SubdirMap};
+use proxmox::api::router::SubdirMap;
 use proxmox::api::schema::*;
-use proxmox::tools::fs::{replace_file, CreateOptions};
+use proxmox::tools::fs::{
+    file_read_firstline, file_read_optional_string, replace_file, CreateOptions,
+};
 use proxmox::{http_err, identity, list_subdirs_api_method, sortable};
 
 use pxar::accessor::aio::Accessor;
 use pxar::EntryKind;
+
+use pbs_client::pxar::create_zip;
+use pbs_tools::blocking::WrappedReaderStream;
+use pbs_tools::stream::{AsyncReaderStream, AsyncChannelWriter};
+use pbs_tools::json::{required_integer_param, required_string_param};
 
 use crate::api2::types::*;
 use crate::api2::node::rrd::create_value_from_rrd;
@@ -29,13 +37,8 @@ use crate::api2::helpers;
 use crate::backup::*;
 use crate::config::datastore;
 use crate::config::cached_user_info::CachedUserInfo;
-use crate::pxar::create_zip;
 
 use crate::server::{jobstate::Job, WorkerTask};
-use crate::tools::{
-    self,
-    AsyncChannelWriter, AsyncReaderStream, WrappedReaderStream,
-};
 
 use crate::config::acl::{
     PRIV_DATASTORE_AUDIT,
@@ -45,6 +48,15 @@ use crate::config::acl::{
     PRIV_DATASTORE_BACKUP,
     PRIV_DATASTORE_VERIFY,
 };
+
+const GROUP_NOTES_FILE_NAME: &str = "notes";
+
+fn get_group_note_path(store: &DataStore, group: &BackupGroup) -> PathBuf {
+    let mut note_path = store.base_path();
+    note_path.push(group.group_path());
+    note_path.push(GROUP_NOTES_FILE_NAME);
+    note_path
+}
 
 fn check_priv_or_backup_owner(
     store: &DataStore,
@@ -58,18 +70,6 @@ fn check_priv_or_backup_owner(
     if privs & required_privs == 0 {
         let owner = store.get_owner(group)?;
         check_backup_owner(&owner, auth_id)?;
-    }
-    Ok(())
-}
-
-fn check_backup_owner(
-    owner: &Authid,
-    auth_id: &Authid,
-) -> Result<(), Error> {
-    let correct_owner = owner == auth_id
-        || (owner.is_token() && &Authid::from(owner.user().clone()) == auth_id);
-    if !correct_owner {
-        bail!("backup owner check failed ({} != {})", auth_id, owner);
     }
     Ok(())
 }
@@ -204,6 +204,9 @@ pub fn list_groups(
                 })
                 .to_owned();
 
+            let note_path = get_group_note_path(&datastore, &group);
+            let comment = file_read_firstline(&note_path).ok();
+
             group_info.push(GroupListItem {
                 backup_type: group.backup_type().to_string(),
                 backup_id: group.backup_id().to_string(),
@@ -211,12 +214,55 @@ pub fn list_groups(
                 owner: Some(owner),
                 backup_count,
                 files: last_backup.files,
+                comment,
             });
 
             group_info
         });
 
     Ok(group_info)
+}
+
+#[api(
+    input: {
+        properties: {
+            store: {
+                schema: DATASTORE_SCHEMA,
+            },
+            "backup-type": {
+                schema: BACKUP_TYPE_SCHEMA,
+            },
+            "backup-id": {
+                schema: BACKUP_ID_SCHEMA,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(
+            &["datastore", "{store}"],
+            PRIV_DATASTORE_MODIFY| PRIV_DATASTORE_PRUNE,
+            true),
+    },
+)]
+/// Delete backup group including all snapshots.
+pub fn delete_group(
+    store: String,
+    backup_type: String,
+    backup_id: String,
+    _info: &ApiMethod,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<Value, Error> {
+
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+
+    let group = BackupGroup::new(backup_type, backup_id);
+    let datastore = DataStore::lookup_datastore(&store)?;
+
+    check_priv_or_backup_owner(&datastore, &group, &auth_id, PRIV_DATASTORE_MODIFY)?;
+
+    datastore.remove_backup_group(&group)?;
+
+    Ok(Value::Null)
 }
 
 #[api(
@@ -604,6 +650,14 @@ pub fn status(
                 schema: BACKUP_ID_SCHEMA,
                 optional: true,
             },
+            "ignore-verified": {
+                schema: IGNORE_VERIFIED_BACKUPS_SCHEMA,
+                optional: true,
+            },
+            "outdated-after": {
+                schema: VERIFICATION_OUTDATED_AFTER_SCHEMA,
+                optional: true,
+            },
             "backup-time": {
                 schema: BACKUP_TIME_SCHEMA,
                 optional: true,
@@ -626,9 +680,12 @@ pub fn verify(
     backup_type: Option<String>,
     backup_id: Option<String>,
     backup_time: Option<i64>,
+    ignore_verified: Option<bool>,
+    outdated_after: Option<i64>,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<Value, Error> {
     let datastore = DataStore::lookup_datastore(&store)?;
+    let ignore_verified = ignore_verified.unwrap_or(true);
 
     let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
     let worker_id;
@@ -677,7 +734,9 @@ pub fn verify(
                     &verify_worker,
                     &backup_dir,
                     worker.upid().clone(),
-                    None,
+                    Some(&move |manifest| {
+                        verify_filter(ignore_verified, outdated_after, manifest)
+                    }),
                 )? {
                     res.push(backup_dir.to_string());
                 }
@@ -688,7 +747,9 @@ pub fn verify(
                     &backup_group,
                     &mut StoreProgress::new(1),
                     worker.upid(),
-                    None,
+                    Some(&move |manifest| {
+                        verify_filter(ignore_verified, outdated_after, manifest)
+                    }),
                 )?;
                 failed_dirs
             } else {
@@ -701,7 +762,14 @@ pub fn verify(
                     None
                 };
 
-                verify_all_backups(&verify_worker, worker.upid(), owner, None)?
+                verify_all_backups(
+                    &verify_worker,
+                    worker.upid(),
+                    owner,
+                    Some(&move |manifest| {
+                        verify_filter(ignore_verified, outdated_after, manifest)
+                    }),
+                )?
             };
             if !failed_dirs.is_empty() {
                 worker.log("Failed to verify the following snapshots/groups:");
@@ -717,106 +785,61 @@ pub fn verify(
     Ok(json!(upid_str))
 }
 
-#[macro_export]
-macro_rules! add_common_prune_prameters {
-    ( [ $( $list1:tt )* ] ) => {
-        add_common_prune_prameters!([$( $list1 )* ] ,  [])
-    };
-    ( [ $( $list1:tt )* ] ,  [ $( $list2:tt )* ] ) => {
-        [
-            $( $list1 )*
-            (
-                "keep-daily",
-                true,
-                &PRUNE_SCHEMA_KEEP_DAILY,
-            ),
-            (
-                "keep-hourly",
-                true,
-                &PRUNE_SCHEMA_KEEP_HOURLY,
-            ),
-            (
-                "keep-last",
-                true,
-                &PRUNE_SCHEMA_KEEP_LAST,
-            ),
-            (
-                "keep-monthly",
-                true,
-                &PRUNE_SCHEMA_KEEP_MONTHLY,
-            ),
-            (
-                "keep-weekly",
-                true,
-                &PRUNE_SCHEMA_KEEP_WEEKLY,
-            ),
-            (
-                "keep-yearly",
-                true,
-                &PRUNE_SCHEMA_KEEP_YEARLY,
-            ),
-            $( $list2 )*
-        ]
-    }
-}
-
-pub const API_RETURN_SCHEMA_PRUNE: Schema = ArraySchema::new(
-    "Returns the list of snapshots and a flag indicating if there are kept or removed.",
-    &PruneListItem::API_SCHEMA
-).schema();
-
-pub const API_METHOD_PRUNE: ApiMethod = ApiMethod::new(
-    &ApiHandler::Sync(&prune),
-    &ObjectSchema::new(
-        "Prune the datastore.",
-        &add_common_prune_prameters!([
-            ("backup-id", false, &BACKUP_ID_SCHEMA),
-            ("backup-type", false, &BACKUP_TYPE_SCHEMA),
-            ("dry-run", true, &BooleanSchema::new(
-                "Just show what prune would do, but do not delete anything.")
-             .schema()
-            ),
-        ],[
-            ("store", false, &DATASTORE_SCHEMA),
-        ])
-    ))
-    .returns(ReturnType::new(false, &API_RETURN_SCHEMA_PRUNE))
-    .access(None, &Permission::Privilege(
-    &["datastore", "{store}"],
-    PRIV_DATASTORE_MODIFY | PRIV_DATASTORE_PRUNE,
-    true)
-);
-
+#[api(
+    input: {
+        properties: {
+            "backup-id": {
+                schema: BACKUP_ID_SCHEMA,
+            },
+            "backup-type": {
+                schema: BACKUP_TYPE_SCHEMA,
+            },
+            "dry-run": {
+                optional: true,
+                type: bool,
+                default: false,
+                description: "Just show what prune would do, but do not delete anything.",
+            },
+            "prune-options": {
+                type: PruneOptions,
+                flatten: true,
+            },
+            store: {
+                schema: DATASTORE_SCHEMA,
+            },
+        },
+    },
+    returns: {
+        type: Array,
+        description: "Returns the list of snapshots and a flag indicating if there are kept or removed.",
+        items: {
+            type: PruneListItem,
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["datastore", "{store}"], PRIV_DATASTORE_MODIFY | PRIV_DATASTORE_PRUNE, true),
+    },
+)]
+/// Prune a group on the datastore
 pub fn prune(
-    param: Value,
-    _info: &ApiMethod,
+    backup_id: String,
+    backup_type: String,
+    dry_run: bool,
+    prune_options: PruneOptions,
+    store: String,
+    _param: Value,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<Value, Error> {
 
-    let store = tools::required_string_param(&param, "store")?;
-    let backup_type = tools::required_string_param(&param, "backup-type")?;
-    let backup_id = tools::required_string_param(&param, "backup-id")?;
-
     let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
 
-    let dry_run = param["dry-run"].as_bool().unwrap_or(false);
-
-    let group = BackupGroup::new(backup_type, backup_id);
+    let group = BackupGroup::new(&backup_type, &backup_id);
 
     let datastore = DataStore::lookup_datastore(&store)?;
 
     check_priv_or_backup_owner(&datastore, &group, &auth_id, PRIV_DATASTORE_MODIFY)?;
 
-    let prune_options = PruneOptions {
-        keep_last: param["keep-last"].as_u64(),
-        keep_hourly: param["keep-hourly"].as_u64(),
-        keep_daily: param["keep-daily"].as_u64(),
-        keep_weekly: param["keep-weekly"].as_u64(),
-        keep_monthly: param["keep-monthly"].as_u64(),
-        keep_yearly: param["keep-yearly"].as_u64(),
-    };
-
-    let worker_id = format!("{}:{}/{}", store, backup_type, backup_id);
+    let worker_id = format!("{}:{}/{}", store, &backup_type, &backup_id);
 
     let mut prune_result = Vec::new();
 
@@ -897,6 +920,62 @@ pub fn prune(
     worker.log_result(&Ok(()));
 
     Ok(json!(prune_result))
+}
+
+#[api(
+    input: {
+        properties: {
+            "dry-run": {
+                optional: true,
+                type: bool,
+                default: false,
+                description: "Just show what prune would do, but do not delete anything.",
+            },
+            "prune-options": {
+                type: PruneOptions,
+                flatten: true,
+            },
+            store: {
+                schema: DATASTORE_SCHEMA,
+            },
+        },
+    },
+    returns: {
+        schema: UPID_SCHEMA,
+    },
+    access: {
+        permission: &Permission::Privilege(&["datastore", "{store}"], PRIV_DATASTORE_MODIFY | PRIV_DATASTORE_PRUNE, true),
+    },
+)]
+/// Prune the datastore
+pub fn prune_datastore(
+    dry_run: bool,
+    prune_options: PruneOptions,
+    store: String,
+    _param: Value,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<String, Error> {
+
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+
+    let datastore = DataStore::lookup_datastore(&store)?;
+
+    let upid_str = WorkerTask::new_thread(
+        "prune",
+        Some(store.clone()),
+        auth_id.clone(),
+        false,
+        move |worker| crate::server::prune_datastore(
+            worker.clone(),
+            auth_id,
+            prune_options,
+            &store,
+            datastore,
+            dry_run
+        ),
+    )?;
+
+    Ok(upid_str)
 }
 
 #[api(
@@ -1032,16 +1111,16 @@ pub fn download_file(
 ) -> ApiResponseFuture {
 
     async move {
-        let store = tools::required_string_param(&param, "store")?;
+        let store = required_string_param(&param, "store")?;
         let datastore = DataStore::lookup_datastore(store)?;
 
         let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
 
-        let file_name = tools::required_string_param(&param, "file-name")?.to_owned();
+        let file_name = required_string_param(&param, "file-name")?.to_owned();
 
-        let backup_type = tools::required_string_param(&param, "backup-type")?;
-        let backup_id = tools::required_string_param(&param, "backup-id")?;
-        let backup_time = tools::required_integer_param(&param, "backup-time")?;
+        let backup_type = required_string_param(&param, "backup-type")?;
+        let backup_id = required_string_param(&param, "backup-id")?;
+        let backup_time = required_integer_param(&param, "backup-time")?;
 
         let backup_dir = BackupDir::new(backup_type, backup_id, backup_time)?;
 
@@ -1102,16 +1181,16 @@ pub fn download_file_decoded(
 ) -> ApiResponseFuture {
 
     async move {
-        let store = tools::required_string_param(&param, "store")?;
+        let store = required_string_param(&param, "store")?;
         let datastore = DataStore::lookup_datastore(store)?;
 
         let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
 
-        let file_name = tools::required_string_param(&param, "file-name")?.to_owned();
+        let file_name = required_string_param(&param, "file-name")?.to_owned();
 
-        let backup_type = tools::required_string_param(&param, "backup-type")?;
-        let backup_id = tools::required_string_param(&param, "backup-id")?;
-        let backup_time = tools::required_integer_param(&param, "backup-time")?;
+        let backup_type = required_string_param(&param, "backup-type")?;
+        let backup_id = required_string_param(&param, "backup-id")?;
+        let backup_time = required_integer_param(&param, "backup-time")?;
 
         let backup_dir = BackupDir::new(backup_type, backup_id, backup_time)?;
 
@@ -1140,7 +1219,7 @@ pub fn download_file_decoded(
                 manifest.verify_file(&file_name, &csum, size)?;
 
                 let chunk_reader = LocalChunkReader::new(datastore, None, CryptMode::None);
-                let reader = AsyncIndexReader::new(index, chunk_reader);
+                let reader = CachedChunkReader::new(chunk_reader, index, 1).seekable();
                 Body::wrap_stream(AsyncReaderStream::new(reader)
                     .map_err(move |err| {
                         eprintln!("error during streaming of '{:?}' - {}", path, err);
@@ -1155,7 +1234,7 @@ pub fn download_file_decoded(
                 manifest.verify_file(&file_name, &csum, size)?;
 
                 let chunk_reader = LocalChunkReader::new(datastore, None, CryptMode::None);
-                let reader = AsyncIndexReader::new(index, chunk_reader);
+                let reader = CachedChunkReader::new(chunk_reader, index, 1).seekable();
                 Body::wrap_stream(AsyncReaderStream::with_buffer_size(reader, 4*1024*1024)
                     .map_err(move |err| {
                         eprintln!("error during streaming of '{:?}' - {}", path, err);
@@ -1216,14 +1295,14 @@ pub fn upload_backup_log(
 ) -> ApiResponseFuture {
 
     async move {
-        let store = tools::required_string_param(&param, "store")?;
+        let store = required_string_param(&param, "store")?;
         let datastore = DataStore::lookup_datastore(store)?;
 
         let file_name =  CLIENT_LOG_BLOB_NAME;
 
-        let backup_type = tools::required_string_param(&param, "backup-type")?;
-        let backup_id = tools::required_string_param(&param, "backup-id")?;
-        let backup_time = tools::required_integer_param(&param, "backup-time")?;
+        let backup_type = required_string_param(&param, "backup-type")?;
+        let backup_id = required_string_param(&param, "backup-id")?;
+        let backup_time = required_integer_param(&param, "backup-time")?;
 
         let backup_dir = BackupDir::new(backup_type, backup_id, backup_time)?;
 
@@ -1363,16 +1442,16 @@ pub fn pxar_file_download(
 ) -> ApiResponseFuture {
 
     async move {
-        let store = tools::required_string_param(&param, "store")?;
+        let store = required_string_param(&param, "store")?;
         let datastore = DataStore::lookup_datastore(&store)?;
 
         let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
 
-        let filepath = tools::required_string_param(&param, "filepath")?.to_owned();
+        let filepath = required_string_param(&param, "filepath")?.to_owned();
 
-        let backup_type = tools::required_string_param(&param, "backup-type")?;
-        let backup_id = tools::required_string_param(&param, "backup-id")?;
-        let backup_time = tools::required_integer_param(&param, "backup-time")?;
+        let backup_type = required_string_param(&param, "backup-type")?;
+        let backup_id = required_string_param(&param, "backup-id")?;
+        let backup_time = required_integer_param(&param, "backup-time")?;
 
         let backup_dir = BackupDir::new(backup_type, backup_id, backup_time)?;
 
@@ -1492,6 +1571,86 @@ pub fn get_rrd_stats(
         timeframe,
         cf,
     )
+}
+
+#[api(
+    input: {
+        properties: {
+            store: {
+                schema: DATASTORE_SCHEMA,
+            },
+            "backup-type": {
+                schema: BACKUP_TYPE_SCHEMA,
+            },
+            "backup-id": {
+                schema: BACKUP_ID_SCHEMA,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["datastore", "{store}"], PRIV_DATASTORE_AUDIT | PRIV_DATASTORE_BACKUP, true),
+    },
+)]
+/// Get "notes" for a backup group
+pub fn get_group_notes(
+    store: String,
+    backup_type: String,
+    backup_id: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<String, Error> {
+    let datastore = DataStore::lookup_datastore(&store)?;
+
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+    let backup_group = BackupGroup::new(backup_type, backup_id);
+
+    check_priv_or_backup_owner(&datastore, &backup_group, &auth_id, PRIV_DATASTORE_AUDIT)?;
+
+    let note_path = get_group_note_path(&datastore, &backup_group);
+    Ok(file_read_optional_string(note_path)?.unwrap_or_else(|| "".to_owned()))
+}
+
+#[api(
+    input: {
+        properties: {
+            store: {
+                schema: DATASTORE_SCHEMA,
+            },
+            "backup-type": {
+                schema: BACKUP_TYPE_SCHEMA,
+            },
+            "backup-id": {
+                schema: BACKUP_ID_SCHEMA,
+            },
+            notes: {
+                description: "A multiline text.",
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["datastore", "{store}"],
+                                           PRIV_DATASTORE_MODIFY | PRIV_DATASTORE_BACKUP,
+                                           true),
+    },
+)]
+/// Set "notes" for a backup group
+pub fn set_group_notes(
+    store: String,
+    backup_type: String,
+    backup_id: String,
+    notes: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<(), Error> {
+    let datastore = DataStore::lookup_datastore(&store)?;
+
+    let auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+    let backup_group = BackupGroup::new(backup_type, backup_id);
+
+    check_priv_or_backup_owner(&datastore, &backup_group, &auth_id, PRIV_DATASTORE_MODIFY)?;
+
+    let note_path = get_group_note_path(&datastore, &backup_group);
+    replace_file(note_path, notes.as_bytes(), CreateOptions::new())?;
+
+    Ok(())
 }
 
 #[api(
@@ -1719,9 +1878,16 @@ const DATASTORE_INFO_SUBDIRS: SubdirMap = &[
             .post(&API_METHOD_START_GARBAGE_COLLECTION)
     ),
     (
+        "group-notes",
+        &Router::new()
+            .get(&API_METHOD_GET_GROUP_NOTES)
+            .put(&API_METHOD_SET_GROUP_NOTES)
+    ),
+    (
         "groups",
         &Router::new()
             .get(&API_METHOD_LIST_GROUPS)
+            .delete(&API_METHOD_DELETE_GROUP)
     ),
     (
         "notes",
@@ -1733,6 +1899,11 @@ const DATASTORE_INFO_SUBDIRS: SubdirMap = &[
         "prune",
         &Router::new()
             .post(&API_METHOD_PRUNE)
+    ),
+    (
+        "prune-datastore",
+        &Router::new()
+            .post(&API_METHOD_PRUNE_DATASTORE)
     ),
     (
         "pxar-file-download",

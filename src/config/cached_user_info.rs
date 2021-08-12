@@ -7,10 +7,12 @@ use anyhow::{Error, bail};
 use proxmox::api::section_config::SectionConfigData;
 use lazy_static::lazy_static;
 use proxmox::api::UserInformation;
+use proxmox::tools::time::epoch_i64;
 
 use super::acl::{AclTree, ROLE_NAMES, ROLE_ADMIN};
 use super::user::{ApiToken, User};
 use crate::api2::types::{Authid, Userid};
+use crate::tools::Memcom;
 
 /// Cache User/Group/Token/Acl configuration data for fast permission tests
 pub struct CachedUserInfo {
@@ -18,16 +20,15 @@ pub struct CachedUserInfo {
     acl_tree: Arc<AclTree>,
 }
 
-fn now() -> i64 { unsafe { libc::time(std::ptr::null_mut()) } }
-
 struct ConfigCache {
     data: Option<Arc<CachedUserInfo>>,
     last_update: i64,
+    last_user_cache_generation: usize,
 }
 
 lazy_static! {
     static ref CACHED_CONFIG: RwLock<ConfigCache> = RwLock::new(
-        ConfigCache { data: None, last_update: 0 }
+        ConfigCache { data: None, last_update: 0, last_user_cache_generation: 0 }
     );
 }
 
@@ -35,10 +36,16 @@ impl CachedUserInfo {
 
     /// Returns a cached instance (up to 5 seconds old).
     pub fn new() -> Result<Arc<Self>, Error> {
-        let now = now();
+        let now = epoch_i64();
+
+        let memcom = Memcom::new()?;
+        let user_cache_generation = memcom.user_cache_generation();
+
         { // limit scope
             let cache = CACHED_CONFIG.read().unwrap();
-            if (now - cache.last_update) < 5 {
+            if (user_cache_generation == cache.last_user_cache_generation) &&
+                ((now - cache.last_update) < 5)
+            {
                 if let Some(ref config) = cache.data {
                     return Ok(config.clone());
                 }
@@ -52,6 +59,7 @@ impl CachedUserInfo {
 
         let mut cache = CACHED_CONFIG.write().unwrap();
         cache.last_update = now;
+        cache.last_user_cache_generation = user_cache_generation;
         cache.data = Some(config.clone());
 
         Ok(config)
@@ -65,34 +73,26 @@ impl CachedUserInfo {
         }
     }
 
+    /// Test if a user_id is enabled and not expired
+    pub fn is_active_user_id(&self, userid: &Userid) -> bool {
+        if let Ok(info) = self.user_cfg.lookup::<User>("user", userid.as_str()) {
+            info.is_active()
+        } else {
+            false
+        }
+    }
+
     /// Test if a authentication id is enabled and not expired
     pub fn is_active_auth_id(&self, auth_id: &Authid) -> bool {
         let userid = auth_id.user();
 
-        if let Ok(info) = self.user_cfg.lookup::<User>("user", userid.as_str()) {
-            if !info.enable.unwrap_or(true) {
-                return false;
-            }
-            if let Some(expire) = info.expire {
-                if expire > 0 && expire <= now() {
-                    return false;
-                }
-            }
-        } else {
+        if !self.is_active_user_id(userid) {
             return false;
         }
 
         if auth_id.is_token() {
             if let Ok(info) = self.user_cfg.lookup::<ApiToken>("token", &auth_id.to_string()) {
-                if !info.enable.unwrap_or(true) {
-                    return false;
-                }
-                if let Some(expire) = info.expire {
-                    if expire > 0 && expire <= now() {
-                        return false;
-                    }
-                }
-                return true;
+                return info.is_active();
             } else {
                 return false;
             }

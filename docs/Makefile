@@ -46,22 +46,34 @@ PRUNE_SIMULATOR_FILES := 					\
 	prune-simulator/clear-trigger.png			\
 	prune-simulator/prune-simulator.js
 
+PRUNE_SIMULATOR_JS_SOURCE :=						\
+	/usr/share/javascript/proxmox-widget-toolkit-dev/Toolkit.js	\
+	prune-simulator/prune-simulator_source.js
+
+LTO_BARCODE_JS_SOURCE :=						\
+	/usr/share/javascript/proxmox-widget-toolkit-dev/Toolkit.js	\
+	lto-barcode/code39.js						\
+	lto-barcode/prefix-field.js					\
+	lto-barcode/label-style.js					\
+	lto-barcode/tape-type.js					\
+	lto-barcode/paper-size.js					\
+	lto-barcode/page-layout.js					\
+	lto-barcode/page-calibration.js					\
+	lto-barcode/label-list.js					\
+	lto-barcode/label-setup.js					\
+	lto-barcode/lto-barcode.js
+
 LTO_BARCODE_FILES :=						\
 	lto-barcode/index.html					\
-	lto-barcode/code39.js					\
-	lto-barcode/prefix-field.js				\
-	lto-barcode/label-style.js				\
-	lto-barcode/tape-type.js				\
-	lto-barcode/paper-size.js				\
-	lto-barcode/page-layout.js				\
-	lto-barcode/page-calibration.js				\
-	lto-barcode/label-list.js				\
-	lto-barcode/label-setup.js				\
-	lto-barcode/lto-barcode.js
+	lto-barcode/lto-barcode-generator.js
 
 API_VIEWER_SOURCES=				\
 	api-viewer/index.html			\
 	api-viewer/apidoc.js
+
+API_VIEWER_FILES :=							\
+	api-viewer/apidata.js						\
+	/usr/share/javascript/proxmox-widget-toolkit-dev/APIViewer.js	\
 
 # Sphinx documentation setup
 SPHINXOPTS    =
@@ -190,14 +202,23 @@ proxmox-file-restore.1: proxmox-file-restore/man1.rst  proxmox-file-restore/desc
 .PHONY: onlinehelpinfo
 onlinehelpinfo:
 	@echo "Generating OnlineHelpInfo.js..."
-	$(SPHINXBUILD) -b proxmox-scanrefs $(ALLSPHINXOPTS) $(BUILDDIR)/scanrefs
+	$(SPHINXBUILD) -b proxmox-scanrefs -Q $(ALLSPHINXOPTS) $(BUILDDIR)/scanrefs
 	@echo "Build finished. OnlineHelpInfo.js is in $(BUILDDIR)/scanrefs."
 
 api-viewer/apidata.js: ${COMPILEDIR}/docgen
 	${COMPILEDIR}/docgen apidata.js >$@
 
-api-viewer/apidoc.js: api-viewer/apidata.js api-viewer/PBSAPI.js
-	cat api-viewer/apidata.js api-viewer/PBSAPI.js >$@
+api-viewer/apidoc.js: ${API_VIEWER_FILES}
+	cat ${API_VIEWER_FILES} >$@.tmp
+	mv $@.tmp $@
+
+prune-simulator/prune-simulator.js: ${PRUNE_SIMULATOR_JS_SOURCE}
+	cat ${PRUNE_SIMULATOR_JS_SOURCE} >$@.tmp
+	mv $@.tmp $@
+
+lto-barcode/lto-barcode-generator.js: ${LTO_BARCODE_JS_SOURCE}
+	cat ${LTO_BARCODE_JS_SOURCE} >$@.tmp
+	mv $@.tmp $@
 
 .PHONY: html
 html: ${GENERATED_SYNOPSIS} images/proxmox-logo.svg custom.css conf.py ${PRUNE_SIMULATOR_FILES} ${LTO_BARCODE_FILES} ${API_VIEWER_SOURCES}
@@ -228,6 +249,7 @@ epub3: ${GENERATED_SYNOPSIS}
 
 clean:
 	rm -r -f *~ *.1 ${BUILDDIR} ${GENERATED_SYNOPSIS} api-viewer/apidata.js
+	rm -f api-viewer/apidoc.js lto-barcode/lto-barcode-generator.js prune-simulator/prune-simulator.js
 
 
 install_manual_pages: ${MAN1_PAGES} ${MAN5_PAGES}

@@ -18,14 +18,10 @@ use proxmox::api::{
     router::ReturnType,
 };
 
-use proxmox_backup::backup::{
-    load_and_decrypt_key,
-    CryptConfig,
-    KeyDerivationConfig,
-    DataChunkBuilder,
-};
-
-use proxmox_backup::client::*;
+use pbs_client::tools::key_source::get_encryption_key_password;
+use pbs_client::{BackupRepository, BackupWriter};
+use pbs_datastore::{CryptConfig, KeyDerivationConfig, load_and_decrypt_key};
+use pbs_datastore::data_blob::DataChunkBuilder;
 
 use crate::{
     KEYFILE_SCHEMA, REPO_URL_SCHEMA,
@@ -33,8 +29,6 @@ use crate::{
     record_repository,
     connect,
 };
-
-use crate::proxmox_client_tools::key_source::get_encryption_key_password;
 
 #[api()]
 #[derive(Copy, Clone, Serialize)]

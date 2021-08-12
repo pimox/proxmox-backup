@@ -2,10 +2,18 @@ Ext.define('pbs-datastore-statistics', {
     extend: 'Ext.data.Model',
 
     fields: [
-	'store', 'total', 'used', 'avail', 'estimated-full-date',
+	'store',
+	'total',
+	'used',
+	'avail',
+	'estimated-full-date',
+	'error',
 	{
 	    name: 'history',
 	    convert: function(values) {
+		if (!values) {
+		    return [];
+		}
 		let last = null;
 		return values.map(v => {
 		    if (v !== undefined && v !== null) {
@@ -41,6 +49,7 @@ Ext.define('PBS.DatastoreStatistics', {
     alias: 'widget.pbsDatastoresStatistics',
 
     title: gettext('Datastore Usage'),
+    disableSelection: true,
 
     emptyText: gettext('No Data'),
 
@@ -57,27 +66,36 @@ Ext.define('PBS.DatastoreStatistics', {
 	    text: gettext('Name'),
 	    dataIndex: 'store',
 	    sortable: true,
+	    renderer: (value, metaData, record, rowIndex, colIndex, store) => {
+		let err = record.get('error');
+		if (err) {
+		    metaData.tdAttr = `data-qtip="${Ext.htmlEncode(err)}"`;
+		    metaData.tdCls = 'proxmox-invalid-row';
+		    return `${value || ''} <i class="fa fa-fw critical fa-exclamation-circle"></i>`;
+		}
+		return value;
+	    },
 	},
 	{
 	    text: gettext('Size'),
 	    dataIndex: 'total',
 	    sortable: true,
 	    width: 90,
-	    renderer: Proxmox.Utils.format_size,
+	    renderer: v => v === undefined || v < 0 ? '-' : Proxmox.Utils.format_size(v),
 	},
 	{
 	    text: gettext('Used'),
 	    dataIndex: 'used',
 	    sortable: true,
 	    width: 90,
-	    renderer: Proxmox.Utils.format_size,
+	    renderer: v => v === undefined || v < 0 ? '-' : Proxmox.Utils.format_size(v),
 	},
 	{
 	    text: gettext('Available'),
 	    dataIndex: 'avail',
 	    sortable: true,
 	    width: 90,
-	    renderer: Proxmox.Utils.format_size,
+	    renderer: v => v === undefined || v < 0 ? '-' : Proxmox.Utils.format_size(v),
 	},
 	{
 	    text: gettext('Usage %'),

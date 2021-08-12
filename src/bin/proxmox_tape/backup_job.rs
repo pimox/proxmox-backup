@@ -3,12 +3,10 @@ use serde_json::Value;
 
 use proxmox::api::{api, cli::*, RpcEnvironment, ApiHandler};
 
+use pbs_client::{connect_to_localhost, view_task_result};
+
 use proxmox_backup::{
     config,
-    client::{
-        connect_to_localhost,
-        view_task_result,
-    },
     api2::{
         self,
         types::*,
@@ -30,7 +28,8 @@ fn list_tape_backup_jobs(param: Value, rpcenv: &mut dyn RpcEnvironment) -> Resul
 
     let output_format = get_output_format(&param);
 
-    let info = &api2::config::tape_backup_job::API_METHOD_LIST_TAPE_BACKUP_JOBS;
+    //let info = &api2::config::tape_backup_job::API_METHOD_LIST_TAPE_BACKUP_JOBS;
+    let info = &api2::tape::backup::API_METHOD_LIST_TAPE_BACKUP_JOBS;
     let mut data = match info.handler {
         ApiHandler::Sync(handler) => (handler)(param, info, rpcenv)?,
         _ => unreachable!(),
@@ -42,6 +41,8 @@ fn list_tape_backup_jobs(param: Value, rpcenv: &mut dyn RpcEnvironment) -> Resul
         .column(ColumnConfig::new("pool"))
         .column(ColumnConfig::new("drive"))
         .column(ColumnConfig::new("schedule"))
+        .column(ColumnConfig::new("next-run").renderer(pbs_tools::format::render_epoch))
+        .column(ColumnConfig::new("next-media-label"))
         .column(ColumnConfig::new("comment"));
 
     format_and_print_result_full(&mut data, &info.returns, &output_format, &options);

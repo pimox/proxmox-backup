@@ -13,8 +13,9 @@ use anyhow::{bail, Error};
 
 use proxmox::tools::Uuid;
 
+use pbs_datastore::task_log;
+
 use crate::{
-    task_log,
     backup::{
         DataStore,
     },
@@ -71,11 +72,12 @@ impl PoolWriter {
         drive_name: &str,
         worker: &WorkerTask,
         notify_email: Option<String>,
+        force_media_set: bool,
     ) -> Result<Self, Error> {
 
         let current_time = proxmox::tools::time::epoch_i64();
 
-        let new_media_set_reason = pool.start_write_session(current_time)?;
+        let new_media_set_reason = pool.start_write_session(current_time, force_media_set)?;
         if let Some(reason) = new_media_set_reason {
             task_log!(
                 worker,
@@ -613,7 +615,7 @@ fn update_media_set_label(
 
     let new_media = match old_set {
         None => {
-            worker.log("wrinting new media set label".to_string());
+            worker.log("writing new media set label".to_string());
             drive.write_media_set_label(new_set, key_config.as_ref())?;
             media_catalog = MediaCatalog::overwrite(status_path, media_id, false)?;
             true
@@ -634,7 +636,7 @@ fn update_media_set_label(
                 false
             } else {
                 worker.log(
-                    format!("wrinting new media set label (overwrite '{}/{}')",
+                    format!("writing new media set label (overwrite '{}/{}')",
                             media_set_label.uuid.to_string(), media_set_label.seq_nr)
                 );
 

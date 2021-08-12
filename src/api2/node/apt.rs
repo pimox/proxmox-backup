@@ -5,12 +5,23 @@ use std::collections::HashMap;
 use proxmox::list_subdirs_api_method;
 use proxmox::api::{api, RpcEnvironment, RpcEnvironmentType, Permission};
 use proxmox::api::router::{Router, SubdirMap};
+use proxmox::tools::fs::{replace_file, CreateOptions};
 
+use proxmox_apt::repositories::{
+    APTRepositoryFile, APTRepositoryFileError, APTRepositoryHandle, APTRepositoryInfo,
+    APTStandardRepository,
+};
+use proxmox_http::ProxyConfig;
+
+use crate::config::node;
 use crate::server::WorkerTask;
-use crate::tools::{apt, http::SimpleHttp, subscription};
-
+use crate::tools::{
+    apt,
+    pbs_simple_http,
+    subscription,
+};
 use crate::config::acl::{PRIV_SYS_AUDIT, PRIV_SYS_MODIFY};
-use crate::api2::types::{Authid, APTUpdateInfo, NODE_SCHEMA, UPID_SCHEMA};
+use crate::api2::types::{Authid, APTUpdateInfo, NODE_SCHEMA, PROXMOX_CONFIG_DIGEST_SCHEMA, UPID_SCHEMA};
 
 #[api(
     input: {
@@ -46,10 +57,38 @@ fn apt_update_available(_param: Value) -> Result<Value, Error> {
     Ok(json!(cache.package_status))
 }
 
+pub fn update_apt_proxy_config(proxy_config: Option<&ProxyConfig>) -> Result<(), Error> {
+
+    const PROXY_CFG_FN: &str = "/etc/apt/apt.conf.d/76pveproxy"; // use same file as PVE
+
+    if let Some(proxy_config) = proxy_config {
+        let proxy = proxy_config.to_proxy_string()?;
+        let data = format!("Acquire::http::Proxy \"{}\";\n", proxy);
+        replace_file(PROXY_CFG_FN, data.as_bytes(), CreateOptions::new())
+    } else {
+        match std::fs::remove_file(PROXY_CFG_FN) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => bail!("failed to remove proxy config '{}' - {}", PROXY_CFG_FN, err),
+        }
+    }
+}
+
+fn read_and_update_proxy_config() -> Result<Option<ProxyConfig>, Error> {
+    let proxy_config = if let Ok((node_config, _digest)) = node::config() {
+        node_config.http_proxy()
+    } else {
+        None
+    };
+    update_apt_proxy_config(proxy_config.as_ref())?;
+
+    Ok(proxy_config)
+}
+
 fn do_apt_update(worker: &WorkerTask, quiet: bool) -> Result<(), Error> {
     if !quiet { worker.log("starting apt-get update") }
 
-    // TODO: set proxy /etc/apt/apt.conf.d/76pbsproxy like PVE
+    read_and_update_proxy_config()?;
 
     let mut command = std::process::Command::new("apt-get");
     command.arg("update");
@@ -152,6 +191,7 @@ pub fn apt_update_database(
 }
 
 #[api(
+    protected: true,
     input: {
         properties: {
             node: {
@@ -180,7 +220,7 @@ fn apt_get_changelog(
     param: Value,
 ) -> Result<Value, Error> {
 
-    let name = crate::tools::required_string_param(&param, "name")?.to_owned();
+    let name = pbs_tools::json::required_string_param(&param, "name")?.to_owned();
     let version = param["version"].as_str();
 
     let pkg_info = apt::list_installed_apt_packages(|data| {
@@ -194,12 +234,13 @@ fn apt_get_changelog(
         bail!("Package '{}' not found", name);
     }
 
-    let mut client = SimpleHttp::new(None); // TODO: pass proxy_config
+    let proxy_config = read_and_update_proxy_config()?;
+    let mut client = pbs_simple_http(proxy_config);
 
     let changelog_url = &pkg_info[0].change_log_url;
     // FIXME: use 'apt-get changelog' for proxmox packages as well, once repo supports it
     if changelog_url.starts_with("http://download.proxmox.com/") {
-        let changelog = crate::tools::runtime::block_on(client.get_string(changelog_url, None))
+        let changelog = pbs_runtime::block_on(client.get_string(changelog_url, None))
             .map_err(|err| format_err!("Error downloading changelog from '{}': {}", changelog_url, err))?;
         Ok(json!(changelog))
 
@@ -223,7 +264,7 @@ fn apt_get_changelog(
         auth_header.insert("Authorization".to_owned(),
             format!("Basic {}", base64::encode(format!("{}:{}", key, id))));
 
-        let changelog = crate::tools::runtime::block_on(client.get_string(changelog_url, Some(&auth_header)))
+        let changelog = pbs_runtime::block_on(client.get_string(changelog_url, Some(&auth_header)))
             .map_err(|err| format_err!("Error downloading changelog from '{}': {}", changelog_url, err))?;
         Ok(json!(changelog))
 
@@ -311,8 +352,8 @@ pub fn get_versions() -> Result<Vec<APTUpdateInfo>, Error> {
         packages.push(unknown_package("proxmox-backup".into(), Some(running_kernel)));
     }
 
-    let version = crate::api2::version::PROXMOX_PKG_VERSION;
-    let release = crate::api2::version::PROXMOX_PKG_RELEASE;
+    let version = pbs_buildcfg::PROXMOX_PKG_VERSION;
+    let release = pbs_buildcfg::PROXMOX_PKG_RELEASE;
     let daemon_version_info = Some(format!("running version: {}.{}", version, release));
     if let Some(pkg) = pbs_packages.iter().find(|pkg| pkg.package == "proxmox-backup-server") {
         let mut pkg = pkg.clone();
@@ -352,8 +393,224 @@ pub fn get_versions() -> Result<Vec<APTUpdateInfo>, Error> {
     Ok(packages)
 }
 
+#[api(
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+        },
+    },
+    returns: {
+        type: Object,
+        description: "Result from parsing the APT repository files in /etc/apt/.",
+        properties: {
+            files: {
+                description: "List of parsed repository files.",
+                type: Array,
+                items: {
+                    type: APTRepositoryFile,
+                },
+            },
+            errors: {
+                description: "List of problematic files.",
+                type: Array,
+                items: {
+                    type: APTRepositoryFileError,
+                },
+            },
+            digest: {
+                schema: PROXMOX_CONFIG_DIGEST_SCHEMA,
+            },
+            infos: {
+                description: "List of additional information/warnings about the repositories.",
+                items: {
+                    type: APTRepositoryInfo,
+                },
+            },
+            "standard-repos": {
+                description: "List of standard repositories and their configuration status.",
+                items: {
+                    type: APTStandardRepository,
+                },
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&[], PRIV_SYS_AUDIT, false),
+    },
+)]
+/// Get APT repository information.
+pub fn get_repositories() -> Result<Value, Error> {
+    let (files, errors, digest) = proxmox_apt::repositories::repositories()?;
+    let digest = proxmox::tools::digest_to_hex(&digest);
+
+    let suite = proxmox_apt::repositories::get_current_release_codename()?;
+
+    let infos = proxmox_apt::repositories::check_repositories(&files, suite);
+    let standard_repos = proxmox_apt::repositories::standard_repositories(&files, "pbs", suite);
+
+    Ok(json!({
+        "files": files,
+        "errors": errors,
+        "digest": digest,
+        "infos": infos,
+        "standard-repos": standard_repos,
+    }))
+}
+
+#[api(
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+            handle: {
+                type: APTRepositoryHandle,
+            },
+            digest: {
+                schema: PROXMOX_CONFIG_DIGEST_SCHEMA,
+                optional: true,
+            },
+        },
+    },
+    protected: true,
+    access: {
+        permission: &Permission::Privilege(&[], PRIV_SYS_MODIFY, false),
+    },
+)]
+/// Add the repository identified by the `handle`.
+/// If the repository is already configured, it will be set to enabled.
+///
+/// The `digest` parameter asserts that the configuration has not been modified.
+pub fn add_repository(handle: APTRepositoryHandle, digest: Option<String>) -> Result<(), Error> {
+    let (mut files, errors, current_digest) = proxmox_apt::repositories::repositories()?;
+
+    let suite = proxmox_apt::repositories::get_current_release_codename()?;
+
+    if let Some(expected_digest) = digest {
+        let current_digest = proxmox::tools::digest_to_hex(&current_digest);
+        crate::tools::assert_if_modified(&expected_digest, &current_digest)?;
+    }
+
+    // check if it's already configured first
+    for file in files.iter_mut() {
+        for repo in file.repositories.iter_mut() {
+            if repo.is_referenced_repository(handle, "pbs", &suite.to_string()) {
+                if repo.enabled {
+                    return Ok(());
+                }
+
+                repo.set_enabled(true);
+                file.write()?;
+
+                return Ok(());
+            }
+        }
+    }
+
+    let (repo, path) = proxmox_apt::repositories::get_standard_repository(handle, "pbs", suite);
+
+    if let Some(error) = errors.iter().find(|error| error.path == path) {
+        bail!(
+            "unable to parse existing file {} - {}",
+            error.path,
+            error.error,
+        );
+    }
+
+    if let Some(file) = files.iter_mut().find(|file| file.path == path) {
+        file.repositories.push(repo);
+
+        file.write()?;
+    } else {
+        let mut file = match APTRepositoryFile::new(&path)? {
+            Some(file) => file,
+            None => bail!("invalid path - {}", path),
+        };
+
+        file.repositories.push(repo);
+
+        file.write()?;
+    }
+
+    Ok(())
+}
+
+#[api(
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+            path: {
+                description: "Path to the containing file.",
+                type: String,
+            },
+            index: {
+                description: "Index within the file (starting from 0).",
+                type: usize,
+            },
+            enabled: {
+                description: "Whether the repository should be enabled or not.",
+                type: bool,
+                optional: true,
+            },
+            digest: {
+                schema: PROXMOX_CONFIG_DIGEST_SCHEMA,
+                optional: true,
+            },
+        },
+    },
+    protected: true,
+    access: {
+        permission: &Permission::Privilege(&[], PRIV_SYS_MODIFY, false),
+    },
+)]
+/// Change the properties of the specified repository.
+///
+/// The `digest` parameter asserts that the configuration has not been modified.
+pub fn change_repository(
+    path: String,
+    index: usize,
+    enabled: Option<bool>,
+    digest: Option<String>,
+) -> Result<(), Error> {
+    let (mut files, errors, current_digest) = proxmox_apt::repositories::repositories()?;
+
+    if let Some(expected_digest) = digest {
+        let current_digest = proxmox::tools::digest_to_hex(&current_digest);
+        crate::tools::assert_if_modified(&expected_digest, &current_digest)?;
+    }
+
+    if let Some(error) = errors.iter().find(|error| error.path == path) {
+        bail!("unable to parse file {} - {}", error.path, error.error);
+    }
+
+    if let Some(file) = files.iter_mut().find(|file| file.path == path) {
+        if let Some(repo) = file.repositories.get_mut(index) {
+            if let Some(enabled) = enabled {
+                repo.set_enabled(enabled);
+            }
+
+            file.write()?;
+        } else {
+            bail!("invalid index - {}", index);
+        }
+    } else {
+        bail!("invalid path - {}", path);
+    }
+
+    Ok(())
+}
+
 const SUBDIRS: SubdirMap = &[
     ("changelog", &Router::new().get(&API_METHOD_APT_GET_CHANGELOG)),
+    ("repositories", &Router::new()
+        .get(&API_METHOD_GET_REPOSITORIES)
+        .post(&API_METHOD_CHANGE_REPOSITORY)
+        .put(&API_METHOD_ADD_REPOSITORY)
+    ),
     ("update", &Router::new()
         .get(&API_METHOD_APT_UPDATE_AVAILABLE)
         .post(&API_METHOD_APT_UPDATE_DATABASE)

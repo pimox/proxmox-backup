@@ -30,6 +30,9 @@ use proxmox::api::{
 };
 use proxmox::http_err;
 
+use pbs_tools::compression::{DeflateEncoder, Level};
+use pbs_tools::stream::AsyncReaderStream;
+
 use super::auth::AuthError;
 use super::environment::RestEnvironment;
 use super::formatter::*;
@@ -39,8 +42,7 @@ use crate::api2::types::{Authid, Userid};
 use crate::auth_helpers::*;
 use crate::config::cached_user_info::CachedUserInfo;
 use crate::tools;
-use crate::tools::compression::{CompressionMethod, DeflateEncoder, Level};
-use crate::tools::AsyncReaderStream;
+use crate::tools::compression::CompressionMethod;
 use crate::tools::FileLogger;
 
 extern "C" {
@@ -152,14 +154,13 @@ fn log_response(
     let path = &path_query[..MAX_URI_QUERY_LENGTH.min(path_query.len())];
 
     let status = resp.status();
-
     if !(status.is_success() || status.is_informational()) {
         let reason = status.canonical_reason().unwrap_or("unknown reason");
 
-        let mut message = "request failed";
-        if let Some(data) = resp.extensions().get::<ErrorMessageExtension>() {
-            message = &data.0;
-        }
+        let message = match resp.extensions().get::<ErrorMessageExtension>() {
+            Some(data) => &data.0,
+            None => "request failed",
+        };
 
         log::error!(
             "{} {}: {} {}: [client {}] {}",
@@ -201,7 +202,7 @@ pub fn auth_logger() -> Result<FileLogger, Error> {
         owned_by_backup: true,
         ..Default::default()
     };
-    FileLogger::new(crate::buildcfg::API_AUTH_LOG_FN, logger_options)
+    FileLogger::new(pbs_buildcfg::API_AUTH_LOG_FN, logger_options)
 }
 
 fn get_proxied_peer(headers: &HeaderMap) -> Option<std::net::SocketAddr> {
@@ -254,7 +255,10 @@ impl tower_service::Service<Request<Body>> for ApiService {
                         Some(apierr) => (apierr.message.clone(), apierr.code),
                         _ => (err.to_string(), StatusCode::BAD_REQUEST),
                     };
-                    Response::builder().status(code).body(err.into())?
+                    Response::builder()
+                        .status(code)
+                        .extension(ErrorMessageExtension(err.to_string()))
+                        .body(err.into())?
                 }
             };
             let logger = config.get_file_log();
@@ -561,7 +565,8 @@ async fn simple_static_file_download(
     let mut response = match compression {
         Some(CompressionMethod::Deflate) => {
             let mut enc = DeflateEncoder::with_quality(data, Level::Default);
-            enc.compress_vec(&mut file, CHUNK_SIZE_LIMIT as usize).await?;
+            enc.compress_vec(&mut file, CHUNK_SIZE_LIMIT as usize)
+                .await?;
             let mut response = Response::new(enc.into_inner().into());
             response.headers_mut().insert(
                 header::CONTENT_ENCODING,

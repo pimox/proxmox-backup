@@ -30,6 +30,18 @@ SERVICE_BIN := \
 RESTORE_BIN := \
 	proxmox-restore-daemon
 
+SUBCRATES := \
+	pbs-api-types \
+	pbs-buildcfg \
+	pbs-client \
+	pbs-datastore \
+	pbs-fuse-loop \
+	pbs-runtime \
+	pbs-systemd \
+	pbs-tools \
+	proxmox-backup-banner \
+	pxar-bin
+
 ifeq ($(BUILD_MODE), release)
 CARGO_BUILD_ARGS += --release
 COMPILEDIR := target/release
@@ -63,7 +75,9 @@ DSC = rust-${PACKAGE}_${DEB_VERSION}.dsc
 
 DESTDIR=
 
-all: cargo-build $(SUBDIRS)
+tests ?= --workspace
+
+all: $(SUBDIRS)
 
 .PHONY: $(SUBDIRS)
 $(SUBDIRS):
@@ -75,19 +89,20 @@ test:
 	$(CARGO) test $(tests) $(CARGO_BUILD_ARGS)
 
 doc:
-	$(CARGO) doc --no-deps $(CARGO_BUILD_ARGS)
+	$(CARGO) doc --workspace --no-deps $(CARGO_BUILD_ARGS)
 
 # always re-create this dir
 .PHONY: build
 build:
 	rm -rf build
-	rm -f debian/control
-	debcargo package --config debian/debcargo.toml --changelog-ready --no-overlay-write-back --directory build proxmox-backup $(shell dpkg-parsechangelog -l debian/changelog -SVersion | sed -e 's/-.*//')
-	sed -e '1,/^$$/ ! d' build/debian/control > build/debian/control.src
-	cat build/debian/control.src build/debian/control.in > build/debian/control
-	rm build/debian/control.in build/debian/control.src
-	cp build/debian/control debian/control
-	rm build/Cargo.lock
+	mkdir build
+	cp -a debian \
+	  Cargo.toml src \
+	  $(SUBCRATES) \
+	  docs etc examples tests www zsh-completions \
+	  defines.mk Makefile \
+	  ./build/
+	rm -f build/Cargo.lock
 	find build/debian -name "*.hint" -delete
 	$(foreach i,$(SUBDIRS), \
 	    $(MAKE) -C build/$(i) clean ;)
@@ -107,7 +122,9 @@ deb: build
 	lintian $(DEBS)
 
 .PHONY: deb-all
-deb-all: $(DOC_DEB) $(DEBS)
+deb-all: build
+	cd build; dpkg-buildpackage -b -us -uc --no-pre-clean
+	lintian $(DEBS) $(DOC_DEB)
 
 .PHONY: dsc
 dsc: $(DSC)
@@ -115,27 +132,55 @@ $(DSC): build
 	cd build; dpkg-buildpackage -S -us -uc -d -nc
 	lintian $(DSC)
 
+.PHONY: clean distclean deb clean
 distclean: clean
-
-clean:
+clean: clean-deb
 	$(foreach i,$(SUBDIRS), \
 	    $(MAKE) -C $(i) clean ;)
 	$(CARGO) clean
-	rm -rf *.deb *.dsc *.tar.gz *.buildinfo *.changes build
+	rm -f .do-cargo-build
 	find . -name '*~' -exec rm {} ';'
+
+# allows one to avoid running cargo clean when one just wants to tidy up after a packgae build
+clean-deb:
+	rm -rf *.deb *.dsc *.tar.gz *.buildinfo *.changes build/
 
 .PHONY: dinstall
 dinstall: ${SERVER_DEB} ${SERVER_DBG_DEB} ${CLIENT_DEB} ${CLIENT_DBG_DEB}
 	dpkg -i $^
 
 # make sure we build binaries before docs
-docs: cargo-build
+docs: $(COMPILEDIR)/dump-catalog-shell-cli $(COMPILEDIR)/docgen
 
 .PHONY: cargo-build
 cargo-build:
-	$(CARGO) build $(CARGO_BUILD_ARGS)
+	rm -f .do-cargo-build
+	$(MAKE) $(COMPILED_BINS)
 
-$(COMPILED_BINS): cargo-build
+$(COMPILED_BINS) $(COMPILEDIR)/dump-catalog-shell-cli $(COMPILEDIR)/docgen: .do-cargo-build
+.do-cargo-build:
+	RUSTFLAGS="--cfg openid" $(CARGO) build $(CARGO_BUILD_ARGS) \
+	    --bin proxmox-backup-api \
+	    --bin proxmox-backup-proxy \
+	    --bin proxmox-backup-manager \
+	    --bin docgen
+	$(CARGO) build $(CARGO_BUILD_ARGS) \
+	    --package proxmox-backup-banner \
+	    --bin proxmox-backup-banner \
+	    --package pxar-bin \
+	    --bin pxar \
+	    --package proxmox-backup \
+	    --bin dump-catalog-shell-cli \
+	    --bin pmt --bin pmtx \
+	    --bin proxmox-backup-client \
+	    --bin proxmox-daily-update \
+	    --bin proxmox-file-restore \
+	    --bin proxmox-restore-daemon \
+	    --bin proxmox-tape \
+	    --bin pxar \
+	    --bin sg-tape-cmd
+	touch "$@"
+
 
 .PHONY: lint
 lint:
@@ -162,12 +207,15 @@ install: $(COMPILED_BINS)
 	    install -m755 $(COMPILEDIR)/$(i) $(DESTDIR)$(LIBEXECDIR)/proxmox-backup/ ;)
 	$(MAKE) -C www install
 	$(MAKE) -C docs install
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(MAKE) test # HACK, only test now to avoid clobbering build files with wrong config
+endif
 
 .PHONY: upload
 upload: ${SERVER_DEB} ${CLIENT_DEB} ${RESTORE_DEB} ${DOC_DEB}
 	# check if working directory is clean
 	git diff --exit-code --stat && git diff --exit-code --stat --staged
 	tar cf - ${SERVER_DEB} ${SERVER_DBG_DEB} ${DOC_DEB} ${CLIENT_DEB} ${CLIENT_DBG_DEB} | \
-	    ssh -X repoman@repo.proxmox.com upload --product pbs --dist buster
-	tar cf - ${CLIENT_DEB} ${CLIENT_DBG_DEB} | ssh -X repoman@repo.proxmox.com upload --product "pve,pmg,pbs-client" --dist buster
-	tar cf - ${RESTORE_DEB} ${RESTORE_DBG_DEB} | ssh -X repoman@repo.proxmox.com upload --product "pve" --dist buster
+	    ssh -X repoman@repo.proxmox.com upload --product pbs --dist bullseye
+	tar cf - ${CLIENT_DEB} ${CLIENT_DBG_DEB} | ssh -X repoman@repo.proxmox.com upload --product "pve,pmg,pbs-client" --dist bullseye
+	tar cf - ${RESTORE_DEB} ${RESTORE_DBG_DEB} | ssh -X repoman@repo.proxmox.com upload --product "pve" --dist bullseye

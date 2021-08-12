@@ -59,6 +59,11 @@ Ext.define('PBS.Dashboard', {
 	    }
 	},
 
+	updateRepositoryStatus: function(store, records, success) {
+	    if (!success) { return; }
+	    let me = this;
+	    me.lookup('nodeInfo').setRepositoryInfo(records[0].data['standard-repos']);
+	},
 
 	updateSubscription: function(store, records, success) {
 	    if (!success) { return; }
@@ -67,72 +72,7 @@ Ext.define('PBS.Dashboard', {
 	    // 2 = all good, 1 = different leves, 0 = none
 	    let subStatus = status.toLowerCase() === 'active' ? 2 : 0;
 	    me.lookup('subscription').setSubStatus(subStatus);
-	},
-
-	updateUsageStats: function(store, records, success) {
-	    if (!success) {
-		return;
-	    }
-	    if (records === undefined || records.length < 1) {
-		return;
-	    }
-	    let me = this;
-	    let viewmodel = me.getViewModel();
-
-	    let res = records[0].data;
-	    viewmodel.set('fingerprint', res.info.fingerprint || Proxmox.Utils.unknownText);
-
-	    let cpu = res.cpu,
-	        mem = res.memory,
-	        root = res.root;
-
-	    var cpuPanel = me.lookup('cpu');
-	    cpuPanel.updateValue(cpu);
-
-	    var memPanel = me.lookup('mem');
-	    memPanel.updateValue(mem.used / mem.total);
-
-	    var hdPanel = me.lookup('root');
-	    hdPanel.updateValue(root.used / root.total);
-	},
-
-	showFingerPrint: function() {
-	    let me = this;
-	    let vm = me.getViewModel();
-	    let fingerprint = vm.get('fingerprint');
-	    Ext.create('Ext.window.Window', {
-		modal: true,
-		width: 600,
-		title: gettext('Fingerprint'),
-		layout: 'form',
-		bodyPadding: '10 0',
-		items: [
-		    {
-			xtype: 'textfield',
-			inputId: 'fingerprintField',
-			value: fingerprint,
-			editable: false,
-		    },
-		],
-		buttons: [
-		    {
-			xtype: 'button',
-			iconCls: 'fa fa-clipboard',
-			handler: function(b) {
-			    var el = document.getElementById('fingerprintField');
-			    el.select();
-			    document.execCommand("copy");
-			},
-			text: gettext('Copy'),
-		    },
-		    {
-			text: gettext('Ok'),
-			handler: function() {
-			    this.up('window').close();
-			},
-		    },
-		],
-	    }).show();
+	    me.lookup('nodeInfo').setSubscriptionStatus(subStatus);
 	},
 
 	updateTasks: function(store, records, success) {
@@ -177,34 +117,39 @@ Ext.define('PBS.Dashboard', {
 	    var sp = Ext.state.Manager.getProvider();
 	    var days = sp.get('dashboard-days') || 30;
 	    me.setDays(days, false);
+
+	    view.mon(sp, 'statechange', function(provider, key, value) {
+		if (key !== 'summarycolumns') {
+		    return;
+		}
+		Proxmox.Utils.updateColumns(view);
+	    });
 	},
     },
 
     viewModel: {
 	data: {
-	    fingerprint: "",
 	    days: 30,
 	},
 
 	formulas: {
-	    disableFPButton: (get) => get('fingerprint') === "",
 	    sinceEpoch: (get) => (Date.now()/1000 - get('days') * 24*3600).toFixed(0),
 	},
 
 	stores: {
-	    usage: {
-		storeid: 'dash-usage',
+	    repositories: {
+		storeid: 'dash-repositories',
 		type: 'update',
-		interval: 3000,
+		interval: 15000,
 		autoStart: true,
 		autoLoad: true,
 		autoDestroy: true,
 		proxy: {
 		    type: 'proxmox',
-		    url: '/api2/json/nodes/localhost/status',
+		    url: '/api2/json/nodes/localhost/apt/repositories',
 		},
 		listeners: {
-		    load: 'updateUsageStats',
+		    load: 'updateRepositoryStatus',
 		},
 	    },
 	    subscription: {
@@ -245,6 +190,12 @@ Ext.define('PBS.Dashboard', {
 	},
     },
 
+    listeners: {
+	resize: function(panel) {
+	    Proxmox.Utils.updateColumns(panel);
+	},
+    },
+
     title: gettext('Dashboard'),
 
     layout: {
@@ -252,6 +203,8 @@ Ext.define('PBS.Dashboard', {
     },
 
     bodyPadding: '20 0 0 20',
+
+    minWidth: 700,
 
     defaults: {
 	columnWidth: 0.49,
@@ -271,47 +224,13 @@ Ext.define('PBS.Dashboard', {
 
     items: [
 	{
-	    height: 250,
-	    iconCls: 'fa fa-tasks',
-	    title: gettext('Server Resources'),
-	    bodyPadding: '0 20 0 20',
-	    tools: [
-		{
-		    xtype: 'button',
-		    text: gettext('Show Fingerprint'),
-		    handler: 'showFingerPrint',
-		    bind: {
-			disabled: '{disableFPButton}',
-		    },
-		},
-	    ],
-	    layout: {
-		type: 'hbox',
-		align: 'center',
-	    },
-	    defaults: {
-		xtype: 'proxmoxGauge',
-		spriteFontSize: '20px',
-		flex: 1,
-	    },
-	    items: [
-		{
-		    title: gettext('CPU'),
-		    reference: 'cpu',
-		},
-		{
-		    title: gettext('Memory'),
-		    reference: 'mem',
-		},
-		{
-		    title: gettext('Root Disk'),
-		    reference: 'root',
-		},
-	    ],
+	    xtype: 'pbsNodeInfoPanel',
+	    reference: 'nodeInfo',
+	    height: 280,
 	},
 	{
 	    xtype: 'pbsDatastoresStatistics',
-	    height: 250,
+	    height: 280,
 	},
 	{
 	    xtype: 'pbsLongestTasks',

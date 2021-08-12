@@ -3,8 +3,11 @@ use serde_json::Value;
 
 use proxmox::api::{api, cli::*, RpcEnvironment, ApiHandler};
 
+use pbs_client::{connect_to_localhost, view_task_result};
+
 use proxmox_backup::config;
 use proxmox_backup::api2::{self, types::* };
+use proxmox_backup::config::datastore::DataStoreConfig;
 
 #[api(
     input: {
@@ -67,6 +70,35 @@ fn show_datastore(param: Value, rpcenv: &mut dyn RpcEnvironment) -> Result<Value
     Ok(Value::Null)
 }
 
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            config: {
+                type: DataStoreConfig,
+                flatten: true,
+            },
+            "output-format": {
+                schema: OUTPUT_FORMAT,
+                optional: true,
+            },
+        },
+    },
+)]
+/// Create new datastore config.
+async fn create_datastore(mut param: Value) -> Result<Value, Error> {
+
+    let output_format = extract_output_format(&mut param);
+
+    let mut client = connect_to_localhost()?;
+
+    let result = client.post(&"api2/json/config/datastore", Some(param)).await?;
+
+    view_task_result(&mut client, result, &output_format).await?;
+
+    Ok(Value::Null)
+}
+
 pub fn datastore_commands() -> CommandLineInterface {
 
     let cmd_def = CliCommandMap::new()
@@ -77,7 +109,7 @@ pub fn datastore_commands() -> CommandLineInterface {
                 .completion_cb("name", config::datastore::complete_datastore_name)
         )
         .insert("create",
-                CliCommand::new(&api2::config::datastore::API_METHOD_CREATE_DATASTORE)
+                CliCommand::new(&API_METHOD_CREATE_DATASTORE)
                 .arg_param(&["name", "path"])
         )
         .insert("update",

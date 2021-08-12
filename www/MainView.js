@@ -34,8 +34,14 @@ Ext.define('PBS.MainView', {
 	    return [xtype, config];
 	},
 
-	beforeChangePath: function(path, subpath, action) {
+	beforeChangePath: function(path, subpathOrAction, action) {
 	    var me = this;
+
+	    let subpath = subpathOrAction;
+	    if (!action) {
+		action = subpathOrAction;
+		subpath = undefined;
+	    }
 
 	    let [xtype, config] = me.parseRouterPath(path);
 
@@ -181,7 +187,7 @@ Ext.define('PBS.MainView', {
 
 	    // select treeitem and load page from url fragment, if set
 	    let token = Ext.util.History.getToken() || 'pbsDashboard';
-	    this.redirectTo(token, true);
+	    this.redirectTo(token, { force: true });
 	},
     },
 
@@ -261,7 +267,7 @@ Ext.define('PBS.MainView', {
 	    ],
 	},
 	{
-	    xtype: 'panel',
+	    xtype: 'container',
 	    scrollable: 'y',
 	    border: false,
 	    region: 'west',
@@ -272,6 +278,7 @@ Ext.define('PBS.MainView', {
 	    items: [{
 		xtype: 'navigationtree',
 		minWidth: 180,
+		ui: 'pve-nav',
 		reference: 'navtree',
 		// we have to define it here until extjs 6.2
 		// because of a bug where a viewcontroller does not detect
@@ -281,12 +288,12 @@ Ext.define('PBS.MainView', {
 		},
 	    }, {
 		xtype: 'box',
-		cls: 'x-treelist-nav',
+		cls: 'x-treelist-pve-nav',
 		flex: 1,
 	    }],
 	},
 	{
-	    xtype: 'panel',
+	    xtype: 'container',
 	    layout: { type: 'card' },
 	    region: 'center',
 	    border: false,

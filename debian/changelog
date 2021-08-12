@@ -1,3 +1,363 @@
+rust-proxmox-backup (2.0.9-1) unstable; urgency=medium
+
+  * tape backup: mention groups that were empty
+
+  * tape: compute next-media-label for each tape backup job
+
+  * tape: lto: increase default timeout to 10 minutes
+
+  * ui: display next-media-label for tape backup jobs
+
+  * cli: proxmox-tape backup-job list: use status api and display next-run
+    and next-media-label
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 09 Aug 2021 09:53:29 +0200
+
+rust-proxmox-backup (2.0.8-1) bullseye; urgency=medium
+
+  * use proxmox-apt to 0.6
+
+  * api: apt: adapt to proxmox-apt back-end changes
+
+  * api/ui: allow zstd compression for new zpools
+
+  * tape: media_catalog: add snapshot list cache for catalog
+
+  * api2: tape: media: use MediaCatalog::snapshot_list for content listing
+
+  * tape: lock media_catalog file to to get a consistent view with load_catalog
+
+  * tape: changer: handle libraries that sends wrong amount of data
+
+  * tape: changer: remove unnecesary inquiry parameter
+
+  * api2: tape/restore: commit temporary catalog at the end
+
+  * docs: tape: add instructions on how to restore the catalog
+
+  * ui: tape/ChangerStatus: improve layout for large libraries
+
+  * tape: changer: handle invalid descriptor data from library in status page
+
+  * datastore config: cleanup code (use flatten attribute)
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 02 Aug 2021 10:34:55 +0200
+
+rust-proxmox-backup (2.0.7-1) bullseye; urgency=medium
+
+  * tape changer: better cope with models that are not following spec
+    proposals when returning the status page
+
+  * tape changer: make DVCID information optional, not all devices return it
+
+  * restore daemon: setup the 'backup' system user and group in the minimal
+    restore environment, as we like to ensure that all state files are ownend
+    by them.
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 23 Jul 2021 08:43:51 +0200
+
+rust-proxmox-backup (2.0.6-1) bullseye; urgency=medium
+
+  * increase maximum drives per changer to 255
+
+  * allow one to pass a secret not only directly through the environment value,
+    but also indirectly through a file path, an open file descriptor or a
+    command that can write the secret to standard out.
+
+  * pull in new proxmox library version to improve the file system
+    comaptibility on creation of atomic files, e.g., lock files.
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 22 Jul 2021 10:22:19 +0200
+
+rust-proxmox-backup (2.0.5-2) bullseye; urgency=medium
+
+  * ui: tape: backup overview: increase timeout for media-set content
+
+  * tape: changer: always retry until timeout
+
+  * file-restore: increase lock timeout on QEMU map
+
+  * fix #3515: file-restore-daemon: allow LVs/PVs with dash in name
+
+  * fix #3526: correctly filter tasks with 'since' and 'until'
+
+  * tape: changer: make scsi request for DVCID a separate one, as some
+    libraries cannot handle requesting that combined with volume tags in one
+    go
+
+  * api, ui: datastore: add new 'prune-datastore' api call and expose it with
+    a 'Prune All' button
+
+  * make creating log files more robust so that theys are always owned by the
+    less privileged `backup` user
+
+ -- Proxmox Support Team <support@proxmox.com>  Wed, 21 Jul 2021 09:12:39 +0200
+
+rust-proxmox-backup (2.0.4-1) bullseye; urgency=medium
+
+  * change tape drive lock path to avoid issues with sticky bit on tmpfs
+    mountpoint
+
+  * tape: changer: query transport-element types separately
+
+  * auth: improve thread safety of 'crypt' C-library
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 12 Jul 2021 18:51:21 +0200
+
+rust-proxmox-backup (2.0.3-1) bullseye; urgency=medium
+
+  * api: apt: add repositories info and update calls
+
+  * ui: administration: add APT repositories status and update panel
+
+  * api: access domains: add get/create/update/delete endpoints for realms
+
+  * ui: access control: add 'Realm' tab for adding and editing OpenID Connect
+    identity provider
+
+  * fix #3447: ui: Dashboard: disallow selection of datastore statistics row
+
+  * ui: tapeRestore: make window non-resizable
+
+  * ui: dashboard: rework resource-load panel to a more detailed status panel,
+    showing, among other things, uptime, Kernel version, CPU info and
+    repository status.
+
+  * ui: adminsitration/dashboard: auto-scale columns count and add
+    browser-local setting to override that to a fixed value of columns.
+
+  * fix #3212: api, ui: add support for notes on backup groups
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 12 Jul 2021 08:07:41 +0200
+
+rust-proxmox-backup (2.0.2-1) bullseye; urgency=medium
+
+  * ui: use task list component from widget toolkit
+
+  * api: add keep-job-configs flag to datastore remove endpoint
+
+  * api: config: delete datastore: also remove tape backup jobs
+
+  * ui: tape restore: mark datastore selector as 'not a form field' to fix
+    compatibility with ExtJS 7.0
+
+  * ui: datastore removal: only navigate away when the user actually confirmed
+    the removal of that datastore
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 08 Jul 2021 14:44:12 +0200
+
+rust-proxmox-backup (2.0.1-2) bullseye; urgency=medium
+
+  * file restore daemon: log basic startup steps
+
+  * REST-API: set error message extension for bad-request response log to
+    ensure the actual error is logged in any (access) log, making debugging
+    such issues easier
+
+  * restore daemon: create /run/proxmox-backup on startup as there's now some
+    runtime state saved there, which failed all API requests to the restore
+    daemon otherwise
+
+  * restore daemon: use millisecond log resolution
+
+  * fix #3496: acme: plugin: actually sleep after setting the TXT record,
+    ensuring DNS propagation of that record. This makes it catch up with the
+    docs/web-interface, where the option was already available.
+
+  * docs: initial update to repositories for bullseye
+
+ -- Proxmox Support Team <support@proxmox.com>  Sat, 03 Jul 2021 23:14:49 +0200
+
+rust-proxmox-backup (2.0.0-2) bullseye; urgency=medium
+
+  * file-restore-daemon/disk: add LVM (thin) support
+
+ -- Proxmox Support Team <support@proxmox.com>  Sat, 03 Jul 2021 02:15:16 +0200
+
+rust-proxmox-backup (2.0.0-1) bullseye; urgency=medium
+
+  * initial bump for Debian 11 Bullseye / Proxmox Backup Server 2.0
+
+  * ui: datastore list summary: catch and show errors per datastore
+
+  * ui: dashboard: task summary: add a 'close' tool to the header
+
+  * ensure that backups which are currently being restored or backed up to a
+    tape won't get pruned
+
+  * improve error handling when locking a tape drive for a backup job
+
+  * client/pull: log snapshots that are skipped because of creation time being
+    older than last sync time
+
+  * ui: datastore options: add remove button to drop a datastore from the
+    configuration, without removing any actual data
+
+  * ui: tape: drive selector: do not auto select the drive
+
+  * ui: tape: backup job: use correct default value for pbsUserSelector
+
+  * fix #3433: disks: port over Proxmox VE's S.M.A.R.T wearout logic
+
+  * backup: add helpers for async last recently used (LRU) caches for chunk
+    and index reading of backup snapshot
+
+  * fix #3459: manager: add --ignore-verified and --outdated-after parameters
+
+  * proxmox-backup-manager: show task log on datastore create
+
+  * tape: snapshot reader: read chunks sorted by inode (per index) to improve
+    sequential reads when backing up data from slow spinning disks to tape.
+
+  * file-restore: support ZFS pools
+
+  * improve fix for #3393: pxar create: try to read xattrs/fcaps/acls by default
+
+  * fix compatibility with ExtJS 7.0
+
+  * docs: build api-viewer from widget-toolkit-dev
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 28 Jun 2021 19:35:40 +0200
+
+rust-proxmox-backup (1.1.9-1) stable; urgency=medium
+
+  * lto/sg_tape/encryption: remove non lto-4 supported byte
+
+  * ui: improve tape restore
+
+  * ui: panel/UsageChart: change downloadServerUrl
+
+  * ui: css fixes and cleanups
+
+  * api2/tape: add api call to list media sets
+
+  * ui: tape/BackupOverview: expand pools by default
+
+  * api: node/journal: fix parameter extraction of /nodes/node/journal
+
+  * file-restore-daemon: limit concurrent download calls
+
+  * file-restore-daemon: watchdog: add inhibit for long downloads
+
+  * file-restore-daemon: work around tokio DuplexStream bug
+
+  * apt: fix removal of non-existant http-proxy config
+
+  * file-restore-daemon: disk: add RawFs bucket type
+
+  * file-restore-daemon: disk: ignore "invalid fs" error
+
+ -- Proxmox Support Team <support@proxmox.com>  Tue, 01 Jun 2021 08:24:01 +0200
+
+rust-proxmox-backup (1.1.8-1) stable; urgency=medium
+
+  * api-proxy: implement 'reload-certificate' command and hot-reload proxy
+    certificate when updating via the API
+
+  * ui: add task descriptions for ACME/Let's Encrypt related tasks
+
+  * correctly set apt proxy configuration
+
+  * ui: configuration: support setting a HTTP proxy for APT and subscription
+    checks.
+
+  * ui: tape: add 'Force new Media-Set' checkbox to manual backup
+
+  * ui: datastore/Content: add forget (delete) button for whole backup groups
+
+  * ui: tape: backup overview: move restore buttons inline to action-buttons,
+    making the UX more similar to the datastore content tree-view
+
+  * ui: tape restore: enabling selecting multiple snapshots
+
+  * ui: dashboards statistics: visualize datastores where querying the usage
+    failed
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 21 May 2021 18:21:28 +0200
+
+rust-proxmox-backup (1.1.7-1) unstable; urgency=medium
+
+  * client: use stderr for all fingerprint confirm msgs
+
+  * fix #3391: improve mismatched fingerprint handling
+
+  * tape: add single snapshot restore
+
+  * docs/api-viewer: improve rendering of array format
+
+  * tape/pool_writer: do not unwrap on channel send
+
+  * ui: window/SyncJobEdit: disable autoSelect for remote datastore
+
+  * ui: tape: rename 'Datastore' to 'Target Datastore'
+
+  * manager: acme plugin: auto-complete available DNS challenge types
+
+  * manager: acme plugin: remove ID completion helper from add command
+
+  * completion: ACME plugin type: comment out http type for now, not useful
+
+  * acme: use proxmox-acme-plugins and load schema from there
+
+  * fix 3296: add http_proxy to node config, and provide a cli
+
+  * fix #3331: improve progress for last snapshot in group
+
+  * file-restore: add debug mode with serial access
+
+  * file-restore: support more drives
+
+  * file-restore: add more RAM for VMs with many drives or debug
+
+  * file-restore: try to kill VM when stale
+
+  * make sure URI paths start with a slash
+
+  * tape: use LOCATE(16) SCSI command
+
+  * call create_run_dir() at daemon startup
+
+  * tape/drive: add 'move_to_file' to TapeDriver trait
+
+  * proxmox_restore_daemon: mount ntfs with 'utf8' option
+
+  * client/http_client: add necessary brackets for ipv6
+
+  * docs: tape: clarify LTO-4/5 support
+
+  * tape/restore: optimize chunk restore behaviour
+
+ -- Proxmox Support Team <support@proxmox.com>  Tue, 11 May 2021 13:22:49 +0200
+
+rust-proxmox-backup (1.1.6-2) unstable; urgency=medium
+
+  * fix permissions set in create_run_dir
+
+ -- Proxmox Support Team <support@proxmox.com>  Tue, 04 May 2021 12:25:00 +0200
+
+rust-proxmox-backup (1.1.6-1) unstable; urgency=medium
+
+  * tape restore: do not verify restored files
+
+  * tape restore: add restore speed to logs
+
+  * tape restore: write datastore in separate thread
+
+  * add ACME support
+
+  * add node config
+
+  * docs: user-management: add note about untrusted certificates for
+    webauthn
+
+  * bin: use extract_output_format where necessary
+
+  * add ctime and size function to IndexFile trait
+
+  * ui: tape: handle tapes in changers without barcode
+
+ -- Proxmox Support Team <support@proxmox.com>  Tue, 04 May 2021 12:09:25 +0200
+
 rust-proxmox-backup (1.1.5-3) stable; urgency=medium
 
   * file-restore: use 'norecovery' for XFS filesystem to allow mounting

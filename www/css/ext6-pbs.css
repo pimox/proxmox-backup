@@ -14,10 +14,6 @@
     background-color: #3892d4;
 }
 
-.info-blue {
-    color: #3892d4;
-}
-
 /* make the upper window end visible */
 .x-css-shadow {
     box-shadow: rgb(136,136,136) 0px -1px 15px !important;
@@ -54,6 +50,12 @@
     height: 14px;
     font-size: 14px;
 }
+
+.pmx-icon-size {
+    height: 14px;
+    font-size: 14px;
+}
+
 
 /* displayfield minheight is wrong */
 .x-form-display-field-default {
@@ -143,7 +145,7 @@ table:not(.x-grid-item-selected) tr.x-grid-row.disabled {
     color: #000;
 }
 
-.x-treelist-nav {
+.x-treelist-pve-nav {
     background-color: #f5f5f5;
     border-right: 1px solid #cfcfcf;
 }
@@ -202,6 +204,7 @@ p.logs {
 
 .pmx-button-badge {
     display: inline-block;
+    text-align: center;
     font-weight: bold;
     border-radius: 4px;
     padding: 2px 3px;

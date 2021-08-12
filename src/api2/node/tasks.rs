@@ -8,12 +8,10 @@ use proxmox::api::{api, Router, RpcEnvironment, Permission};
 use proxmox::api::router::SubdirMap;
 use proxmox::{identity, list_subdirs_api_method, sortable};
 
-use crate::tools;
-
 use crate::api2::types::*;
 use crate::api2::pull::check_pull_privs;
 
-use crate::server::{self, UPID, TaskState, TaskListInfoIterator};
+use crate::server::{self, UPID, UPIDExt, TaskState, TaskListInfoIterator};
 use crate::config::acl::{
     PRIV_DATASTORE_MODIFY,
     PRIV_DATASTORE_VERIFY,
@@ -222,7 +220,7 @@ async fn get_task_status(
 
 fn extract_upid(param: &Value) -> Result<UPID, Error> {
 
-    let upid_str = tools::required_string_param(&param, "upid")?;
+    let upid_str = pbs_tools::json::required_string_param(&param, "upid")?;
 
     upid_str.parse::<UPID>()
 }
@@ -256,7 +254,7 @@ fn extract_upid(param: &Value) -> Result<UPID, Error> {
         },
     },
     access: {
-        description: "Users can access there own tasks, or need Sys.Audit on /system/tasks.",
+        description: "Users can access their own tasks, or need Sys.Audit on /system/tasks.",
         permission: &Permission::Anybody,
     },
 )]
@@ -326,7 +324,7 @@ async fn read_task_log(
         },
     },
     access: {
-        description: "Users can stop there own tasks, or need Sys.Modify on /system/tasks.",
+        description: "Users can stop their own tasks, or need Sys.Modify on /system/tasks.",
         permission: &Permission::Anybody,
     },
 )]
@@ -420,7 +418,7 @@ fn stop_task(
         items: { type: TaskListItem },
     },
     access: {
-        description: "Users can only see there own tasks, unless the have Sys.Audit on /system/tasks.",
+        description: "Users can only see their own tasks, unless they have Sys.Audit on /system/tasks.",
         permission: &Permission::Anybody,
     },
 )]
@@ -451,63 +449,73 @@ pub fn list_tasks(
     let list = TaskListInfoIterator::new(running)?;
     let limit = if limit > 0 { limit as usize } else { usize::MAX };
 
-    let result: Vec<TaskListItem> = list
-        .skip_while(|info| {
-            match (info, until) {
-                (Ok(info), Some(until)) => info.upid.starttime > until,
-                (Ok(_), None) => false,
-                (Err(_), _) => false,
-            }
-        })
-        .take_while(|info| {
-            match (info, since) {
-                (Ok(info), Some(since)) => info.upid.starttime > since,
-                (Ok(_), None) => true,
-                (Err(_), _) => false,
-            }
-        })
-        .filter_map(|info| {
+    let mut skipped = 0;
+    let mut result: Vec<TaskListItem> = Vec::new();
+
+    for info in list {
         let info = match info {
             Ok(info) => info,
-            Err(_) => return None,
+            Err(_) => break,
         };
 
+        if let Some(until) = until {
+            if info.upid.starttime > until {
+                continue;
+            }
+        }
+
+        if let Some(since) = since {
+            if let Some(ref state) = info.state {
+                if state.endtime() < since {
+                    // we reached the tasks that ended before our 'since'
+                    // so we can stop iterating
+                    break;
+                }
+            }
+            if info.upid.starttime < since {
+                continue;
+            }
+        }
+
         if !list_all && check_task_access(&auth_id, &info.upid).is_err() {
-            return None;
+            continue;
         }
 
         if let Some(needle) = &userfilter {
-            if !info.upid.auth_id.to_string().contains(needle) { return None; }
+            if !info.upid.auth_id.to_string().contains(needle) { continue; }
         }
 
         if let Some(store) = store {
-            if !check_job_store(&info.upid, store) {
-                return None;
-            }
+            if !check_job_store(&info.upid, store) { continue; }
         }
 
         if let Some(typefilter) = &typefilter {
-            if !info.upid.worker_type.contains(typefilter) {
-                return None;
-            }
+            if !info.upid.worker_type.contains(typefilter) { continue; }
         }
 
         match (&info.state, &statusfilter) {
-            (Some(_), _) if running => return None,
-            (Some(crate::server::TaskState::OK { .. }), _) if errors => return None,
+            (Some(_), _) if running => continue,
+            (Some(crate::server::TaskState::OK { .. }), _) if errors => continue,
             (Some(state), Some(filters)) => {
                 if !filters.contains(&state.tasktype()) {
-                    return None;
+                    continue;
                 }
             },
-            (None, Some(_)) => return None,
+            (None, Some(_)) => continue,
             _ => {},
         }
 
-        Some(info.into())
-    }).skip(start as usize)
-        .take(limit)
-        .collect();
+        if skipped < start as usize {
+            skipped += 1;
+            continue;
+        }
+
+        result.push(info.into());
+
+        if result.len() >= limit {
+            break;
+        }
+    }
 
     let mut count = result.len() + start as usize;
     if !result.is_empty() && result.len() >= limit { // we have a 'virtual' entry as long as we have any new

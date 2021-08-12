@@ -2,6 +2,21 @@ Ext.define('PBS.LoginView', {
     extend: 'Ext.container.Container',
     xtype: 'loginview',
 
+    viewModel: {
+	data: {
+	    openid: false,
+	},
+	formulas: {
+	    button_text: function(get) {
+		if (get("openid") === true) {
+		    return gettext("Login (OpenID redirect)");
+		} else {
+		    return gettext("Login");
+		}
+	    },
+	},
+    },
+
     controller: {
 	xclass: 'Ext.app.ViewController',
 
@@ -15,10 +30,33 @@ Ext.define('PBS.LoginView', {
 		return;
 	    }
 
-	    let params = loginForm.getValues();
+	    let creds = loginForm.getValues();
 
-	    params.username = params.username + '@' + params.realm;
-	    delete params.realm;
+	    if (this.getViewModel().data.openid === true) {
+		const redirectURL = location.origin;
+		try {
+		    let resp = await Proxmox.Async.api2({
+			url: '/api2/extjs/access/openid/auth-url',
+			params: {
+			    realm: creds.realm,
+			    "redirect-url": redirectURL,
+			},
+			method: 'POST',
+		    });
+		    window.location = resp.result.data;
+		} catch (response) {
+		    Proxmox.Utils.authClear();
+		    loginForm.unmask();
+		    Ext.MessageBox.alert(
+			gettext('Error'),
+			gettext('OpenID redirect failed, please try again') + `<br>${response.result.message}`,
+		    );
+		}
+		return;
+	    }
+
+	    creds.username = `${creds.username}@${creds.realm}`;
+	    delete creds.realm;
 
 	    if (loginForm.isVisible()) {
 		loginForm.mask(gettext('Please wait...'), 'x-mask-loading');
@@ -34,9 +72,9 @@ Ext.define('PBS.LoginView', {
 	    sp.set(saveunField.getStateId(), saveunField.getValue());
 
 	    try {
-		let resp = await PBS.Async.api2({
+		let resp = await Proxmox.Async.api2({
 		    url: '/api2/extjs/access/ticket',
-		    params: params,
+		    params: creds,
 		    method: 'POST',
 		});
 
@@ -98,6 +136,14 @@ Ext.define('PBS.LoginView', {
 		    window.location.reload();
 		},
 	    },
+	    'field[name=realm]': {
+		change: function(f, value) {
+		    let record = f.store.getById(value);
+		    if (record === undefined) return;
+		    let data = record.data;
+		    this.getViewModel().set("openid", data.type === "openid");
+		},
+	    },
 	    'button[reference=loginButton]': {
 		click: 'submitForm',
 	    },
@@ -115,6 +161,43 @@ Ext.define('PBS.LoginView', {
 			unField.setValue(username);
 			var pwField = this.lookupReference('passwordField');
 			pwField.focus();
+		    }
+
+		    let auth = Proxmox.Utils.getOpenIDRedirectionAuthorization();
+		    if (auth !== undefined) {
+			Proxmox.Utils.authClear();
+
+			let loginForm = this.lookupReference('loginForm');
+			loginForm.mask(gettext('OpenID login - please wait...'), 'x-mask-loading');
+
+			// openID checks the original redirection URL we used, so pass that too
+			const redirectURL = location.origin;
+
+			Proxmox.Utils.API2Request({
+			    url: '/api2/extjs/access/openid/login',
+			    params: {
+				state: auth.state,
+				code: auth.code,
+				"redirect-url": redirectURL,
+			    },
+			    method: 'POST',
+			    failure: function(response) {
+				loginForm.unmask();
+				let error = response.htmlStatus;
+				Ext.MessageBox.alert(
+				    gettext('Error'),
+				    gettext('OpenID login failed, please try again') + `<br>${error}`,
+				    () => { window.location = redirectURL; },
+				);
+			    },
+			    success: function(response, options) {
+				loginForm.unmask();
+				let creds = response.result.data;
+				PBS.Utils.updateLoginData(creds);
+				PBS.app.changeView('mainview');
+				history.replaceState(null, '', `${redirectURL}#pbsDashboard`);
+			    },
+			});
 		    }
 		},
 	    },
@@ -191,6 +274,10 @@ Ext.define('PBS.LoginView', {
 			    itemId: 'usernameField',
 			    reference: 'usernameField',
 			    stateId: 'login-username',
+			    bind: {
+				visible: "{!openid}",
+				disabled: "{openid}",
+			    },
 			},
 			{
 			    xtype: 'textfield',
@@ -199,6 +286,10 @@ Ext.define('PBS.LoginView', {
 			    name: 'password',
 			    itemId: 'passwordField',
 			    reference: 'passwordField',
+			    bind: {
+				visible: "{!openid}",
+				disabled: "{openid}",
+			    },
 			},
 			{
 			    xtype: 'pmxRealmComboBox',
@@ -223,9 +314,14 @@ Ext.define('PBS.LoginView', {
 			    labelWidth: 250,
 			    labelAlign: 'right',
 			    submitValue: false,
+			    bind: {
+				visible: "{!openid}",
+			    },
 			},
 			{
-			    text: gettext('Login'),
+			    bind: {
+				text: "{button_text}",
+			    },
 			    reference: 'loginButton',
 			    formBind: true,
 			},
@@ -470,7 +566,7 @@ Ext.define('PBS.login.TfaWindow', {
 	    let reject = view.onReject;
 	    view.close();
 
-	    return PBS.Async.api2({
+	    return Proxmox.Async.api2({
 		url: '/api2/extjs/access/ticket',
 		method: 'POST',
 		params,

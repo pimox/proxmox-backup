@@ -20,14 +20,10 @@ use proxmox::{
             SectionConfigPlugin,
         }
     },
-    tools::fs::{
-        open_file_locked,
-        replace_file,
-        CreateOptions,
-    },
 };
 
 use crate::{
+    backup::{open_backup_lockfile, BackupLockGuard},
     api2::types::{
         MEDIA_POOL_NAME_SCHEMA,
         MediaPoolConfig,
@@ -57,10 +53,9 @@ pub const MEDIA_POOL_CFG_FILENAME: &str = "/etc/proxmox-backup/media-pool.cfg";
 /// Lock file name (used to prevent concurrent access)
 pub const MEDIA_POOL_CFG_LOCKFILE: &str = "/etc/proxmox-backup/.media-pool.lck";
 
-
 /// Get exclusive lock
-pub fn lock() -> Result<std::fs::File, Error> {
-    open_file_locked(MEDIA_POOL_CFG_LOCKFILE, std::time::Duration::new(10, 0), true)
+pub fn lock() -> Result<BackupLockGuard, Error> {
+    open_backup_lockfile(MEDIA_POOL_CFG_LOCKFILE, None, true)
 }
 
 /// Read and parse the configuration file
@@ -77,19 +72,7 @@ pub fn config() -> Result<(SectionConfigData, [u8;32]), Error> {
 /// Save the configuration file
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(MEDIA_POOL_CFG_FILENAME, &config)?;
-
-    let backup_user = crate::backup::backup_user()?;
-    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0640);
-    // set the correct owner/group/permissions while saving file
-    // owner(rw) = root, group(r)= backup
-    let options = CreateOptions::new()
-        .perm(mode)
-        .owner(nix::unistd::ROOT)
-        .group(backup_user.gid);
-
-    replace_file(MEDIA_POOL_CFG_FILENAME, raw.as_bytes(), options)?;
-
-    Ok(())
+    crate::backup::replace_backup_config(MEDIA_POOL_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

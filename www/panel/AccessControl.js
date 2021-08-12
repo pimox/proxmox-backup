@@ -37,6 +37,14 @@ Ext.define('PBS.AccessControlPanel', {
 	    itemId: 'permissions',
 	    iconCls: 'fa fa-unlock',
 	},
+	{
+	    xtype: 'pmxAuthView',
+	    baseUrl: '/config/access',
+	    useTypeInUrl: true,
+	    title: gettext('Realms'),
+	    itemId: 'domains',
+	    iconCls: 'fa fa-address-book-o',
+	},
     ],
 
 });

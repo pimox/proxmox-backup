@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::task::Context;
 
 use anyhow::{bail, format_err, Error};
-use futures::future::FutureExt;
 use futures::stream::{StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -21,56 +20,36 @@ use proxmox::{
     },
     api::{
         api,
-        ApiHandler,
         ApiMethod,
         RpcEnvironment,
-        schema::*,
         cli::*,
     },
 };
 use pxar::accessor::{MaybeReady, ReadAt, ReadAtOperation};
 
-use proxmox_backup::tools::{
-    self,
-    StdChannelWriter,
-    TokioWriterAdapter,
+use pbs_api_types::{
+    BACKUP_ID_SCHEMA, BACKUP_TIME_SCHEMA, BACKUP_TYPE_SCHEMA, Authid, CryptMode, GroupListItem,
+    PruneListItem, SnapshotListItem, StorageStatus,
 };
-use proxmox_backup::api2::types::*;
-use proxmox_backup::api2::version;
-use proxmox_backup::client::*;
-use proxmox_backup::pxar::catalog::*;
-use proxmox_backup::backup::{
-    archive_type,
-    decrypt_key,
-    rsa_encrypt_key_config,
-    verify_chunk_size,
-    ArchiveType,
-    AsyncReadChunk,
-    BackupDir,
-    BackupGroup,
-    BackupManifest,
-    BufferedDynamicReader,
-    CATALOG_NAME,
-    CatalogReader,
-    CatalogWriter,
+use pbs_client::{
+    BACKUP_SOURCE_SCHEMA,
+    BackupReader,
+    BackupRepository,
+    BackupSpecificationType,
+    BackupStats,
+    BackupWriter,
     ChunkStream,
-    CryptConfig,
-    CryptMode,
-    DynamicIndexReader,
-    ENCRYPTED_KEY_BLOB_NAME,
     FixedChunkStream,
-    FixedIndexReader,
-    KeyConfig,
-    IndexFile,
-    MANIFEST_BLOB_NAME,
-    Shell,
+    HttpClient,
+    PxarBackupStream,
+    RemoteChunkReader,
+    UploadOptions,
+    delete_ticket_info,
+    parse_backup_specification,
+    view_task_result,
 };
-
-mod proxmox_backup_client;
-use proxmox_backup_client::*;
-
-pub mod proxmox_client_tools;
-use proxmox_client_tools::{
+use pbs_client::catalog_shell::Shell;
+use pbs_client::tools::{
     complete_archive_name, complete_auth_id, complete_backup_group, complete_backup_snapshot,
     complete_backup_source, complete_chunk_size, complete_group_or_snapshot,
     complete_img_archive_name, complete_pxar_archive_name, complete_repository, connect,
@@ -81,6 +60,24 @@ use proxmox_client_tools::{
     },
     CHUNK_SIZE_SCHEMA, REPO_URL_SCHEMA,
 };
+use pbs_datastore::{CATALOG_NAME, CryptConfig, KeyConfig, decrypt_key, rsa_encrypt_key_config};
+use pbs_datastore::backup_info::{BackupDir, BackupGroup};
+use pbs_datastore::catalog::{BackupCatalogWriter, CatalogReader, CatalogWriter};
+use pbs_datastore::chunk_store::verify_chunk_size;
+use pbs_datastore::dynamic_index::{BufferedDynamicReader, DynamicIndexReader};
+use pbs_datastore::fixed_index::FixedIndexReader;
+use pbs_datastore::index::IndexFile;
+use pbs_datastore::manifest::{
+    ENCRYPTED_KEY_BLOB_NAME, MANIFEST_BLOB_NAME, ArchiveType, BackupManifest, archive_type,
+};
+use pbs_datastore::read_chunk::AsyncReadChunk;
+use pbs_datastore::prune::PruneOptions;
+use pbs_tools::sync::StdChannelWriter;
+use pbs_tools::tokio::TokioWriterAdapter;
+use pbs_tools::json;
+
+mod proxmox_backup_client;
+use proxmox_backup_client::*;
 
 fn record_repository(repo: &BackupRepository) {
 
@@ -175,7 +172,7 @@ async fn backup_directory<P: AsRef<Path>>(
     archive_name: &str,
     chunk_size: Option<usize>,
     catalog: Arc<Mutex<CatalogWriter<TokioWriterAdapter<StdChannelWriter>>>>,
-    pxar_create_options: proxmox_backup::pxar::PxarCreateOptions,
+    pxar_create_options: pbs_client::pxar::PxarCreateOptions,
     upload_options: UploadOptions,
 ) -> Result<BackupStats, Error> {
 
@@ -280,7 +277,7 @@ async fn list_backup_groups(param: Value) -> Result<Value, Error> {
 
     let render_files = |_v: &Value, record: &Value| -> Result<String, Error> {
         let item: GroupListItem = serde_json::from_value(record.to_owned())?;
-        Ok(tools::format::render_backup_file_list(&item.files))
+        Ok(pbs_tools::format::render_backup_file_list(&item.files))
     };
 
     let options = default_table_format_options()
@@ -408,9 +405,9 @@ async fn api_version(param: Value) -> Result<(), Error> {
 
     let mut version_info = json!({
         "client": {
-            "version": version::PROXMOX_PKG_VERSION,
-            "release": version::PROXMOX_PKG_RELEASE,
-            "repoid": version::PROXMOX_PKG_REPOID,
+            "version": pbs_buildcfg::PROXMOX_PKG_VERSION,
+            "release": pbs_buildcfg::PROXMOX_PKG_RELEASE,
+            "repoid": pbs_buildcfg::PROXMOX_PKG_REPOID,
         }
     });
 
@@ -424,7 +421,11 @@ async fn api_version(param: Value) -> Result<(), Error> {
         }
     }
     if output_format == "text" {
-        println!("client version: {}.{}", version::PROXMOX_PKG_VERSION, version::PROXMOX_PKG_RELEASE);
+        println!(
+            "client version: {}.{}",
+            pbs_buildcfg::PROXMOX_PKG_VERSION,
+            pbs_buildcfg::PROXMOX_PKG_RELEASE,
+        );
         if let Some(server) = version_info["server"].as_object() {
             let server_version = server["version"].as_str().unwrap();
             let server_release = server["release"].as_str().unwrap();
@@ -481,7 +482,7 @@ fn spawn_catalog_upload(
     encrypt: bool,
 ) -> Result<CatalogUploadResult, Error> {
     let (catalog_tx, catalog_rx) = std::sync::mpsc::sync_channel(10); // allow to buffer 10 writes
-    let catalog_stream = crate::tools::StdChannelStream(catalog_rx);
+    let catalog_stream = pbs_tools::blocking::StdChannelStream(catalog_rx);
     let catalog_chunk_size = 512*1024;
     let catalog_chunk_stream = ChunkStream::new(catalog_stream, Some(catalog_chunk_size));
 
@@ -592,7 +593,7 @@ fn spawn_catalog_upload(
                type: Integer,
                description: "Max number of entries to hold in memory.",
                optional: true,
-               default: proxmox_backup::pxar::ENCODER_MAX_ENTRIES as isize,
+               default: pbs_client::pxar::ENCODER_MAX_ENTRIES as isize,
            },
            "verbose": {
                type: Boolean,
@@ -611,7 +612,7 @@ async fn create_backup(
 
     let repo = extract_repository_from_value(&param)?;
 
-    let backupspec_list = tools::required_array_param(&param, "backupspec")?;
+    let backupspec_list = json::required_array_param(&param, "backupspec")?;
 
     let all_file_systems = param["all-file-systems"].as_bool().unwrap_or(false);
 
@@ -636,7 +637,7 @@ async fn create_backup(
     let include_dev = param["include-dev"].as_array();
 
     let entries_max = param["entries-max"].as_u64()
-        .unwrap_or(proxmox_backup::pxar::ENCODER_MAX_ENTRIES as u64);
+        .unwrap_or(pbs_client::pxar::ENCODER_MAX_ENTRIES as u64);
 
     let empty = Vec::new();
     let exclude_args = param["exclude"].as_array().unwrap_or(&empty);
@@ -859,7 +860,7 @@ async fn create_backup(
                 println!("Upload directory '{}' to '{}' as {}", filename, repo, target);
                 catalog.lock().unwrap().start_directory(std::ffi::CString::new(target.as_str())?.as_c_str())?;
 
-                let pxar_options = proxmox_backup::pxar::PxarCreateOptions {
+                let pxar_options = pbs_client::pxar::PxarCreateOptions {
                     device_set: devices.clone(),
                     patterns: pattern_list.clone(),
                     entries_max: entries_max as usize,
@@ -1066,13 +1067,13 @@ async fn restore(param: Value) -> Result<Value, Error> {
 
     let allow_existing_dirs = param["allow-existing-dirs"].as_bool().unwrap_or(false);
 
-    let archive_name = tools::required_string_param(&param, "archive-name")?;
+    let archive_name = json::required_string_param(&param, "archive-name")?;
 
     let client = connect(&repo)?;
 
     record_repository(&repo);
 
-    let path = tools::required_string_param(&param, "snapshot")?;
+    let path = json::required_string_param(&param, "snapshot")?;
 
     let (backup_type, backup_id, backup_time) = if path.matches('/').count() == 1 {
         let group: BackupGroup = path.parse()?;
@@ -1082,7 +1083,7 @@ async fn restore(param: Value) -> Result<Value, Error> {
         (snapshot.group().backup_type().to_owned(), snapshot.group().backup_id().to_owned(), snapshot.backup_time())
     };
 
-    let target = tools::required_string_param(&param, "target")?;
+    let target = json::required_string_param(&param, "target")?;
     let target = if target == "-" { None } else { Some(target) };
 
     let crypto = crypto_parameters(&param)?;
@@ -1171,7 +1172,7 @@ async fn restore(param: Value) -> Result<Value, Error> {
 
         let mut reader = BufferedDynamicReader::new(index, chunk_reader);
 
-        let options = proxmox_backup::pxar::PxarExtractOptions {
+        let options = pbs_client::pxar::PxarExtractOptions {
             match_list: &[],
             extract_match_default: true,
             allow_existing_dirs,
@@ -1179,10 +1180,10 @@ async fn restore(param: Value) -> Result<Value, Error> {
         };
 
         if let Some(target) = target {
-            proxmox_backup::pxar::extract_archive(
+            pbs_client::pxar::extract_archive(
                 pxar::decoder::Decoder::from_std(reader)?,
                 Path::new(target),
-                proxmox_backup::pxar::Flags::DEFAULT,
+                pbs_client::pxar::Flags::DEFAULT,
                 |path| {
                     if verbose {
                         println!("{:?}", path);
@@ -1224,61 +1225,65 @@ async fn restore(param: Value) -> Result<Value, Error> {
     Ok(Value::Null)
 }
 
-const API_METHOD_PRUNE: ApiMethod = ApiMethod::new(
-    &ApiHandler::Async(&prune),
-    &ObjectSchema::new(
-        "Prune a backup repository.",
-        &proxmox_backup::add_common_prune_prameters!([
-            ("dry-run", true, &BooleanSchema::new(
-                "Just show what prune would do, but do not delete anything.")
-             .schema()),
-            ("group", false, &StringSchema::new("Backup group.").schema()),
-        ], [
-            ("output-format", true, &OUTPUT_FORMAT),
-            (
-                "quiet",
-                true,
-                &BooleanSchema::new("Minimal output - only show removals.")
-                    .schema()
-            ),
-            ("repository", true, &REPO_URL_SCHEMA),
-        ])
-    )
-);
-
-fn prune<'a>(
-    param: Value,
-    _info: &ApiMethod,
-    _rpcenv: &'a mut dyn RpcEnvironment,
-) -> proxmox::api::ApiFuture<'a> {
-    async move {
-        prune_async(param).await
-    }.boxed()
-}
-
-async fn prune_async(mut param: Value) -> Result<Value, Error> {
+#[api(
+    input: {
+        properties: {
+            "dry-run": {
+                type: bool,
+                optional: true,
+                description: "Just show what prune would do, but do not delete anything.",
+            },
+            group: {
+                type: String,
+                description: "Backup group",
+            },
+            "prune-options": {
+                type: PruneOptions,
+                flatten: true,
+            },
+            "output-format": {
+                schema: OUTPUT_FORMAT,
+                optional: true,
+            },
+            quiet: {
+                type: bool,
+                optional: true,
+                default: false,
+                description: "Minimal output - only show removals.",
+            },
+            repository: {
+                schema: REPO_URL_SCHEMA,
+                optional: true,
+            },
+        },
+    },
+)]
+/// Prune a backup repository.
+async fn prune(
+    dry_run: Option<bool>,
+    group: String,
+    prune_options: PruneOptions,
+    quiet: bool,
+    mut param: Value
+) -> Result<Value, Error> {
     let repo = extract_repository_from_value(&param)?;
 
     let mut client = connect(&repo)?;
 
     let path = format!("api2/json/admin/datastore/{}/prune", repo.store());
 
-    let group = tools::required_string_param(&param, "group")?;
     let group: BackupGroup = group.parse()?;
 
-    let output_format = get_output_format(&param);
+    let output_format = extract_output_format(&mut param);
 
-    let quiet = param["quiet"].as_bool().unwrap_or(false);
+    let mut api_param = serde_json::to_value(prune_options)?;
+    if let Some(dry_run) = dry_run {
+        api_param["dry-run"] = dry_run.into();
+    }
+    api_param["backup-type"] = group.backup_type().into();
+    api_param["backup-id"] = group.backup_id().into();
 
-    param.as_object_mut().unwrap().remove("repository");
-    param.as_object_mut().unwrap().remove("group");
-    param.as_object_mut().unwrap().remove("output-format");
-    param.as_object_mut().unwrap().remove("quiet");
-
-    param["backup-type"] = group.backup_type().into();
-    param["backup-id"] = group.backup_id().into();
-
-    let mut result = client.post(&path, Some(param)).await?;
+    let mut result = client.post(&path, Some(api_param)).await?;
 
     record_repository(&repo);
 
@@ -1301,7 +1306,7 @@ async fn prune_async(mut param: Value) -> Result<Value, Error> {
         .sortby("backup-id", false)
         .sortby("backup-time", false)
         .column(ColumnConfig::new("backup-id").renderer(render_snapshot_path).header("snapshot"))
-        .column(ColumnConfig::new("backup-time").renderer(tools::format::render_epoch).header("date"))
+        .column(ColumnConfig::new("backup-time").renderer(pbs_tools::format::render_epoch).header("date"))
         .column(ColumnConfig::new("keep").renderer(render_prune_action).header("action"))
         ;
 
@@ -1376,7 +1381,6 @@ async fn status(param: Value) -> Result<Value, Error> {
     Ok(Value::Null)
 }
 
-use proxmox_backup::client::RemoteChunkReader;
 /// This is a workaround until we have cleaned up the chunk/reader/... infrastructure for better
 /// async use!
 ///
@@ -1413,7 +1417,7 @@ impl ReadAt for BufferedDynamicReadAt {
         self: Pin<&'a Self>,
         _op: ReadAtOperation<'a>,
     ) -> MaybeReady<io::Result<usize>, ReadAtOperation<'a>> {
-        panic!("LocalDynamicReadAt::start_read_at returned Pending");
+        panic!("BufferedDynamicReadAt::start_read_at returned Pending");
     }
 }
 
@@ -1423,13 +1427,13 @@ fn main() {
         .arg_param(&["backupspec"])
         .completion_cb("repository", complete_repository)
         .completion_cb("backupspec", complete_backup_source)
-        .completion_cb("keyfile", tools::complete_file_name)
-        .completion_cb("master-pubkey-file", tools::complete_file_name)
+        .completion_cb("keyfile", pbs_tools::fs::complete_file_name)
+        .completion_cb("master-pubkey-file", pbs_tools::fs::complete_file_name)
         .completion_cb("chunk-size", complete_chunk_size);
 
     let benchmark_cmd_def = CliCommand::new(&API_METHOD_BENCHMARK)
         .completion_cb("repository", complete_repository)
-        .completion_cb("keyfile", tools::complete_file_name);
+        .completion_cb("keyfile", pbs_tools::fs::complete_file_name);
 
     let list_cmd_def = CliCommand::new(&API_METHOD_LIST_BACKUP_GROUPS)
         .completion_cb("repository", complete_repository);
@@ -1442,7 +1446,7 @@ fn main() {
         .completion_cb("repository", complete_repository)
         .completion_cb("snapshot", complete_group_or_snapshot)
         .completion_cb("archive-name", complete_archive_name)
-        .completion_cb("target", tools::complete_file_name);
+        .completion_cb("target", pbs_tools::fs::complete_file_name);
 
     let prune_cmd_def = CliCommand::new(&API_METHOD_PRUNE)
         .arg_param(&["group"])
@@ -1495,6 +1499,6 @@ fn main() {
 
     let rpcenv = CliEnvironment::new();
     run_cli_command(cmd_def, rpcenv, Some(|future| {
-        proxmox_backup::tools::runtime::main(future)
+        pbs_runtime::main(future)
     }));
 }

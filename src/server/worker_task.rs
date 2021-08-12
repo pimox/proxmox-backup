@@ -14,18 +14,20 @@ use tokio::sync::oneshot;
 
 use proxmox::sys::linux::procfs;
 use proxmox::try_block;
-use proxmox::tools::fs::{create_path, open_file_locked, replace_file, CreateOptions};
+use proxmox::tools::fs::{create_path, replace_file, CreateOptions};
 
-use super::UPID;
+use super::{UPID, UPIDExt};
 
-use crate::buildcfg;
+use pbs_buildcfg;
+
 use crate::server;
 use crate::tools::logrotate::{LogRotate, LogRotateFiles};
 use crate::tools::{FileLogger, FileLogOptions};
 use crate::api2::types::{Authid, TaskStateType};
+use crate::backup::{open_backup_lockfile, BackupLockGuard};
 
 macro_rules! taskdir {
-    ($subdir:expr) => (concat!(PROXMOX_BACKUP_LOG_DIR_M!(), "/tasks", $subdir))
+    ($subdir:expr) => (concat!(pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR_M!(), "/tasks", $subdir))
 }
 pub const PROXMOX_BACKUP_TASK_DIR: &str = taskdir!("/");
 pub const PROXMOX_BACKUP_TASK_LOCK_FN: &str = taskdir!("/.active.lock");
@@ -59,7 +61,7 @@ pub async fn worker_is_active(upid: &UPID) -> Result<bool, Error> {
             "upid": upid.to_string(),
         },
     });
-    let status = super::send_command(sock, cmd).await?;
+    let status = super::send_command(sock, &cmd).await?;
 
     if let Some(active) = status.as_bool() {
         Ok(active)
@@ -133,7 +135,7 @@ pub async fn abort_worker(upid: UPID) -> Result<(), Error> {
             "upid": upid.to_string(),
         },
     });
-    super::send_command(sock, cmd).map_ok(|_| ()).await
+    super::send_command(sock, &cmd).map_ok(|_| ()).await
 }
 
 fn parse_worker_status_line(line: &str) -> Result<(String, UPID, Option<TaskState>), Error> {
@@ -162,9 +164,9 @@ pub fn create_task_log_dirs() -> Result<(), Error> {
             .owner(backup_user.uid)
             .group(backup_user.gid);
 
-        create_path(buildcfg::PROXMOX_BACKUP_LOG_DIR, None, Some(opts.clone()))?;
+        create_path(pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR, None, Some(opts.clone()))?;
         create_path(PROXMOX_BACKUP_TASK_DIR, None, Some(opts.clone()))?;
-        create_path(buildcfg::PROXMOX_BACKUP_RUN_DIR, None, Some(opts))?;
+        create_path(pbs_buildcfg::PROXMOX_BACKUP_RUN_DIR, None, Some(opts))?;
         Ok(())
     }).map_err(|err: Error| format_err!("unable to create task log dir - {}", err))?;
 
@@ -312,13 +314,8 @@ pub struct TaskListInfo {
     pub state: Option<TaskState>, // endtime, status
 }
 
-fn lock_task_list_files(exclusive: bool) -> Result<std::fs::File, Error> {
-    let backup_user = crate::backup::backup_user()?;
-
-    let lock = open_file_locked(PROXMOX_BACKUP_TASK_LOCK_FN, std::time::Duration::new(10, 0), exclusive)?;
-    nix::unistd::chown(PROXMOX_BACKUP_TASK_LOCK_FN, Some(backup_user.uid), Some(backup_user.gid))?;
-
-    Ok(lock)
+fn lock_task_list_files(exclusive: bool) -> Result<BackupLockGuard, Error> {
+    open_backup_lockfile(PROXMOX_BACKUP_TASK_LOCK_FN, None, exclusive)
 }
 
 /// checks if the Task Archive is bigger that 'size_threshold' bytes, and
@@ -480,7 +477,7 @@ pub struct TaskListInfoIterator {
     list: VecDeque<TaskListInfo>,
     end: bool,
     archive: Option<LogRotateFiles>,
-    lock: Option<File>,
+    lock: Option<BackupLockGuard>,
 }
 
 impl TaskListInfoIterator {
@@ -788,7 +785,7 @@ impl WorkerTask {
     }
 }
 
-impl crate::task::TaskState for WorkerTask {
+impl pbs_datastore::task::TaskState for WorkerTask {
     fn check_abort(&self) -> Result<(), Error> {
         self.fail_on_abort()
     }
@@ -802,4 +799,24 @@ impl crate::task::TaskState for WorkerTask {
             log::Level::Trace => self.log(&format!("TRACE: {}", message)),
         }
     }
+}
+
+/// Wait for a locally spanned worker task
+///
+/// Note: local workers should print logs to stdout, so there is no
+/// need to fetch/display logs. We just wait for the worker to finish.
+pub async fn wait_for_local_worker(upid_str: &str) -> Result<(), Error> {
+
+    let upid: UPID = upid_str.parse()?;
+
+    let sleep_duration = core::time::Duration::new(0, 100_000_000);
+
+    loop {
+        if worker_is_active_local(&upid) {
+            tokio::time::sleep(sleep_duration).await;
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }

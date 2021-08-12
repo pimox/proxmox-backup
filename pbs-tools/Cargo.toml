@@ -1,0 +1,38 @@
+[package]
+name = "pbs-tools"
+version = "0.1.0"
+authors = ["Proxmox Support Team <support@proxmox.com>"]
+edition = "2018"
+description = "common tools used throughout pbs"
+
+# This must not depend on any subcrates more closely related to pbs itself.
+[dependencies]
+anyhow = "1.0"
+base64 = "0.12"
+bytes = "1.0"
+crc32fast = "1"
+endian_trait = { version = "0.6", features = ["arrays"] }
+flate2 = "1.0"
+foreign-types = "0.3"
+futures = "0.3"
+lazy_static = "1.4"
+libc = "0.2"
+nix = "0.19.1"
+nom = "5.1"
+openssl = "0.10"
+percent-encoding = "2.1"
+regex = "1.2"
+serde = "1.0"
+serde_json = "1.0"
+# rt-multi-thread is required for block_in_place
+tokio = { version = "1.6", features = [ "fs", "io-util", "rt", "rt-multi-thread", "sync" ] }
+url = "2.1"
+walkdir = "2"
+
+proxmox = { version = "0.12.1", default-features = false, features = [ "tokio" ] }
+
+pbs-buildcfg = { path = "../pbs-buildcfg" }
+pbs-runtime = { path = "../pbs-runtime" }
+
+[dev-dependencies]
+tokio = { version = "1.6", features = [ "macros" ] }

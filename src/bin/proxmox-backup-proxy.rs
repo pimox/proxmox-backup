@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Mutex, Arc};
 use std::path::{Path, PathBuf};
 use std::os::unix::io::AsRawFd;
 
@@ -7,9 +7,11 @@ use futures::*;
 
 use openssl::ssl::{SslMethod, SslAcceptor, SslFiletype};
 use tokio_stream::wrappers::ReceiverStream;
+use serde_json::Value;
 
 use proxmox::try_block;
 use proxmox::api::RpcEnvironmentType;
+use proxmox::sys::linux::socket::set_tcp_keepalive;
 
 use proxmox_backup::{
     backup::DataStore,
@@ -30,13 +32,13 @@ use proxmox_backup::{
     },
 };
 
+use pbs_buildcfg::configdir;
 
 use proxmox_backup::api2::types::Authid;
-use proxmox_backup::configdir;
-use proxmox_backup::buildcfg;
 use proxmox_backup::server;
 use proxmox_backup::auth_helpers::*;
 use proxmox_backup::tools::{
+    PROXMOX_BACKUP_TCP_KEEPALIVE_TIME,
     daemon,
     disks::{
         DiskManage,
@@ -44,10 +46,6 @@ use proxmox_backup::tools::{
         get_pool_from_dataset,
     },
     logrotate::LogRotate,
-    socket::{
-        set_tcp_keepalive,
-        PROXMOX_BACKUP_TCP_KEEPALIVE_TIME,
-    },
 };
 
 use proxmox_backup::api2::pull::do_sync_job;
@@ -67,7 +65,7 @@ fn main() -> Result<(), Error> {
         bail!("proxy not running as backup user or group (got uid {} gid {})", running_uid, running_gid);
     }
 
-    proxmox_backup::tools::runtime::main(run())
+    pbs_runtime::main(run())
 }
 
 async fn run() -> Result<(), Error> {
@@ -86,7 +84,7 @@ async fn run() -> Result<(), Error> {
     let _ = csrf_secret(); // load with lazy_static
 
     let mut config = ApiConfig::new(
-        buildcfg::JS_DIR,
+        pbs_buildcfg::JS_DIR,
         &proxmox_backup::api2::ROUTER,
         RpcEnvironmentType::PUBLIC,
         default_api_auth(),
@@ -101,33 +99,56 @@ async fn run() -> Result<(), Error> {
     config.add_alias("widgettoolkit", "/usr/share/javascript/proxmox-widget-toolkit");
     config.add_alias("docs", "/usr/share/doc/proxmox-backup/html");
 
-    let mut indexpath = PathBuf::from(buildcfg::JS_DIR);
+    let mut indexpath = PathBuf::from(pbs_buildcfg::JS_DIR);
     indexpath.push("index.hbs");
     config.register_template("index", &indexpath)?;
     config.register_template("console", "/usr/share/pve-xtermjs/index.html.hbs")?;
 
     let mut commando_sock = server::CommandoSocket::new(server::our_ctrl_sock());
 
-    config.enable_file_log(buildcfg::API_ACCESS_LOG_FN, &mut commando_sock)?;
+    config.enable_file_log(pbs_buildcfg::API_ACCESS_LOG_FN, &mut commando_sock)?;
 
     let rest_server = RestServer::new(config);
 
     //openssl req -x509 -newkey rsa:4096 -keyout /etc/proxmox-backup/proxy.key -out /etc/proxmox-backup/proxy.pem -nodes
-    let key_path = configdir!("/proxy.key");
-    let cert_path = configdir!("/proxy.pem");
 
-    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-    acceptor.set_private_key_file(key_path, SslFiletype::PEM)
-        .map_err(|err| format_err!("unable to read proxy key {} - {}", key_path, err))?;
-    acceptor.set_certificate_chain_file(cert_path)
-        .map_err(|err| format_err!("unable to read proxy cert {} - {}", cert_path, err))?;
-    acceptor.check_private_key().unwrap();
+    // we build the initial acceptor here as we cannot start if this fails
+    let acceptor = make_tls_acceptor()?;
+    let acceptor = Arc::new(Mutex::new(acceptor));
 
-    let acceptor = Arc::new(acceptor.build());
+    // to renew the acceptor we just add a command-socket handler
+    commando_sock.register_command(
+        "reload-certificate".to_string(),
+        {
+            let acceptor = Arc::clone(&acceptor);
+            move |_value| -> Result<_, Error> {
+                log::info!("reloading certificate");
+                match make_tls_acceptor() {
+                    Err(err) => log::error!("error reloading certificate: {}", err),
+                    Ok(new_acceptor) => {
+                        let mut guard = acceptor.lock().unwrap();
+                        *guard = new_acceptor;
+                    }
+                }
+                Ok(Value::Null)
+            }
+        },
+    )?;
+
+    // to remove references for not configured datastores
+    commando_sock.register_command(
+        "datastore-removed".to_string(),
+        |_value| {
+            if let Err(err) = proxmox_backup::backup::DataStore::remove_unused_datastores() {
+                log::error!("could not refresh datastores: {}", err);
+            }
+            Ok(Value::Null)
+        }
+    )?;
 
     let server = daemon::create_daemon(
         ([0,0,0,0,0,0,0,0], 8007).into(),
-        |listener, ready| {
+        move |listener, ready| {
 
             let connections = accept_connections(listener, acceptor, debug);
             let connections = hyper::server::accept::from_stream(ReceiverStream::new(connections));
@@ -145,7 +166,7 @@ async fn run() -> Result<(), Error> {
         "proxmox-backup-proxy.service",
     );
 
-    server::write_pid(buildcfg::PROXMOX_BACKUP_PROXY_PID_FN)?;
+    server::write_pid(pbs_buildcfg::PROXMOX_BACKUP_PROXY_PID_FN)?;
     daemon::systemd_notify(daemon::SystemdNotify::Ready)?;
 
     let init_result: Result<(), Error> = try_block!({
@@ -170,85 +191,114 @@ async fn run() -> Result<(), Error> {
     Ok(())
 }
 
+fn make_tls_acceptor() -> Result<SslAcceptor, Error> {
+    let key_path = configdir!("/proxy.key");
+    let cert_path = configdir!("/proxy.pem");
+
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor.set_private_key_file(key_path, SslFiletype::PEM)
+        .map_err(|err| format_err!("unable to read proxy key {} - {}", key_path, err))?;
+    acceptor.set_certificate_chain_file(cert_path)
+        .map_err(|err| format_err!("unable to read proxy cert {} - {}", cert_path, err))?;
+    acceptor.check_private_key().unwrap();
+
+    Ok(acceptor.build())
+}
+
+type ClientStreamResult =
+    Result<std::pin::Pin<Box<tokio_openssl::SslStream<tokio::net::TcpStream>>>, Error>;
+const MAX_PENDING_ACCEPTS: usize = 1024;
+
 fn accept_connections(
     listener: tokio::net::TcpListener,
-    acceptor: Arc<openssl::ssl::SslAcceptor>,
+    acceptor: Arc<Mutex<openssl::ssl::SslAcceptor>>,
     debug: bool,
-) -> tokio::sync::mpsc::Receiver<Result<std::pin::Pin<Box<tokio_openssl::SslStream<tokio::net::TcpStream>>>, Error>> {
-
-    const MAX_PENDING_ACCEPTS: usize = 1024;
+) -> tokio::sync::mpsc::Receiver<ClientStreamResult> {
 
     let (sender, receiver) = tokio::sync::mpsc::channel(MAX_PENDING_ACCEPTS);
 
-    let accept_counter = Arc::new(());
-
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Err(err) => {
-                    eprintln!("error accepting tcp connection: {}", err);
-                }
-                Ok((sock, _addr)) =>  {
-                    sock.set_nodelay(true).unwrap();
-                    let _ = set_tcp_keepalive(sock.as_raw_fd(), PROXMOX_BACKUP_TCP_KEEPALIVE_TIME);
-                    let acceptor = Arc::clone(&acceptor);
-
-                    let ssl = match openssl::ssl::Ssl::new(acceptor.context()) {
-                        Ok(ssl) => ssl,
-                        Err(err) => {
-                            eprintln!("failed to create Ssl object from Acceptor context - {}", err);
-                            continue;
-                        },
-                    };
-                    let stream = match tokio_openssl::SslStream::new(ssl, sock) {
-                        Ok(stream) => stream,
-                        Err(err) => {
-                            eprintln!("failed to create SslStream using ssl and connection socket - {}", err);
-                            continue;
-                        },
-                    };
-
-                    let mut stream = Box::pin(stream);
-                    let sender = sender.clone();
-
-                    if Arc::strong_count(&accept_counter) > MAX_PENDING_ACCEPTS {
-                        eprintln!("connection rejected - to many open connections");
-                        continue;
-                    }
-
-                    let accept_counter = accept_counter.clone();
-                    tokio::spawn(async move {
-                        let accept_future = tokio::time::timeout(
-                            Duration::new(10, 0), stream.as_mut().accept());
-
-                        let result = accept_future.await;
-
-                        match result {
-                            Ok(Ok(())) => {
-                                if sender.send(Ok(stream)).await.is_err() && debug {
-                                    eprintln!("detect closed connection channel");
-                                }
-                            }
-                            Ok(Err(err)) => {
-                                if debug {
-                                    eprintln!("https handshake failed - {}", err);
-                                }
-                            }
-                            Err(_) => {
-                                if debug {
-                                    eprintln!("https handshake timeout");
-                                }
-                            }
-                        }
-
-                        drop(accept_counter); // decrease reference count
-                    });
-                }
-            }
-        }
-    });
+    tokio::spawn(accept_connection(listener, acceptor, debug, sender));
 
     receiver
+}
+
+async fn accept_connection(
+    listener: tokio::net::TcpListener,
+    acceptor: Arc<Mutex<openssl::ssl::SslAcceptor>>,
+    debug: bool,
+    sender: tokio::sync::mpsc::Sender<ClientStreamResult>,
+) {
+    let accept_counter = Arc::new(());
+
+    loop {
+        let (sock, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) =>  {
+                eprintln!("error accepting tcp connection: {}", err);
+                continue;
+            }
+        };
+
+        sock.set_nodelay(true).unwrap();
+        let _ = set_tcp_keepalive(sock.as_raw_fd(), PROXMOX_BACKUP_TCP_KEEPALIVE_TIME);
+
+        let ssl = { // limit acceptor_guard scope
+            // Acceptor can be reloaded using the command socket "reload-certificate" command
+            let acceptor_guard = acceptor.lock().unwrap();
+
+            match openssl::ssl::Ssl::new(acceptor_guard.context()) {
+                Ok(ssl) => ssl,
+                Err(err) => {
+                    eprintln!("failed to create Ssl object from Acceptor context - {}", err);
+                    continue;
+                },
+            }
+        };
+
+        let stream = match tokio_openssl::SslStream::new(ssl, sock) {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("failed to create SslStream using ssl and connection socket - {}", err);
+                continue;
+            },
+        };
+
+        let mut stream = Box::pin(stream);
+        let sender = sender.clone();
+
+        if Arc::strong_count(&accept_counter) > MAX_PENDING_ACCEPTS {
+            eprintln!("connection rejected - to many open connections");
+            continue;
+        }
+
+        let accept_counter = Arc::clone(&accept_counter);
+        tokio::spawn(async move {
+            let accept_future = tokio::time::timeout(
+                Duration::new(10, 0), stream.as_mut().accept());
+
+            let result = accept_future.await;
+
+            match result {
+                Ok(Ok(())) => {
+                    if sender.send(Ok(stream)).await.is_err() && debug {
+                        eprintln!("detect closed connection channel");
+                    }
+                }
+                Ok(Err(err)) => {
+                    if debug {
+                        eprintln!("https handshake failed - {}", err);
+                    }
+                }
+                Err(_) => {
+                    if debug {
+                        eprintln!("https handshake timeout");
+                    }
+                }
+            }
+
+            drop(accept_counter); // decrease reference count
+        });
+    }
 }
 
 fn start_stat_generator() {
@@ -593,7 +643,7 @@ async fn schedule_tape_backup_jobs() {
                 Err(_) => continue, // could not get lock
             };
             if let Err(err) = do_tape_backup_job(job, job_config.setup, &auth_id, Some(event_str)) {
-                eprintln!("unable to start tape bvackup job {} - {}", &job_id, err);
+                eprintln!("unable to start tape backup job {} - {}", &job_id, err);
             }
         };
     }
@@ -645,18 +695,18 @@ async fn schedule_task_log_rotate() {
 
                 let max_size = 32 * 1024 * 1024 - 1;
                 let max_files = 14;
-                let mut logrotate = LogRotate::new(buildcfg::API_ACCESS_LOG_FN, true)
+                let mut logrotate = LogRotate::new(pbs_buildcfg::API_ACCESS_LOG_FN, true)
                         .ok_or_else(|| format_err!("could not get API access log file names"))?;
 
                 if logrotate.rotate(max_size, None, Some(max_files))? {
                     println!("rotated access log, telling daemons to re-open log file");
-                    proxmox_backup::tools::runtime::block_on(command_reopen_logfiles())?;
+                    pbs_runtime::block_on(command_reopen_logfiles())?;
                     worker.log("API access log was rotated".to_string());
                 } else {
                     worker.log("API access log was not rotated".to_string());
                 }
 
-                let mut logrotate = LogRotate::new(buildcfg::API_AUTH_LOG_FN, true)
+                let mut logrotate = LogRotate::new(pbs_buildcfg::API_AUTH_LOG_FN, true)
                         .ok_or_else(|| format_err!("could not get API auth log file names"))?;
 
                 if logrotate.rotate(max_size, None, Some(max_files))? {
@@ -686,15 +736,11 @@ async fn command_reopen_logfiles() -> Result<(), Error> {
     // only care about the most recent daemon instance for each, proxy & api, as other older ones
     // should not respond to new requests anyway, but only finish their current one and then exit.
     let sock = server::our_ctrl_sock();
-    let f1 = server::send_command(sock, serde_json::json!({
-        "command": "api-access-log-reopen",
-    }));
+    let f1 = server::send_command(sock, "{\"command\":\"api-access-log-reopen\"}\n");
 
-    let pid = server::read_pid(buildcfg::PROXMOX_BACKUP_API_PID_FN)?;
+    let pid = server::read_pid(pbs_buildcfg::PROXMOX_BACKUP_API_PID_FN)?;
     let sock = server::ctrl_sock_from_pid(pid);
-    let f2 = server::send_command(sock, serde_json::json!({
-        "command": "api-access-log-reopen",
-    }));
+    let f2 = server::send_command(sock, "{\"command\":\"api-access-log-reopen\"}\n");
 
     match futures::join!(f1, f2) {
         (Err(e1), Err(e2)) => Err(format_err!("reopen commands failed, proxy: {}; api: {}", e1, e2)),
@@ -741,7 +787,7 @@ async fn generate_host_stats(save: bool) {
     use proxmox_backup::config::datastore;
 
 
-    proxmox_backup::tools::runtime::block_in_place(move || {
+    pbs_runtime::block_in_place(move || {
 
         match read_proc_stat() {
             Ok(stat) => {
